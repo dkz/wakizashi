@@ -17,9 +17,8 @@ pub fn main() !void {
                 .source_name = a,
                 .source = inp,
             };
-            while (stream.next()) |token| {
-                std.debug.print("{}: {s}\n", .{ token.t, token.slice });
-            }
+            const tokens = try stream.tokenize(gpa.allocator());
+            _ = tokens;
         }
     }
 }
@@ -52,6 +51,15 @@ const TokenStream = struct {
         number: usize,
         column: usize,
     };
+
+    fn tokenize(self: *TokenStream, allocator: std.mem.Allocator) ![]Token {
+        var tokens = std.ArrayList(Token).init(allocator);
+        errdefer tokens.deinit();
+        while (self.next()) |t| {
+            try tokens.append(t);
+        }
+        return tokens.toOwnedSlice();
+    }
 
     /// Current cursor position in the buffer including line number, column,
     /// and a view of an entire string at cursor.
@@ -177,6 +185,87 @@ const TokenStream = struct {
     }
 };
 
+fn Consumed(comptime T: type) type {
+    return struct { usize, T };
+}
+
+const Term = union(enum) {
+    underscore,
+    literal: []const u8,
+    variable: []const u8,
+};
+
+fn parseTerm(from: []const Token, at: usize) !Consumed(Term) {
+    if (from.len <= at) return error.ParseError;
+    const token = from[at];
+    switch (token.t) {
+        .id => {
+            if (std.mem.eql(u8, token.slice, "_")) return .{ 1, Term.underscore };
+            if (std.ascii.isUpper(token.slice[0])) return .{ 1, Term{ .variable = token.slice } };
+            return .{ 1, Term{ .literal = token.slice } };
+        },
+        .string => return .{ 1, Term{ .literal = token.slice } },
+        else => return error.ParseError,
+    }
+}
+
+fn parsePredicate(from: []const Token, at: usize) !Consumed([]const u8) {
+    if (from.len <= at) return error.ParseError;
+    const token = from[at];
+    if (token.t != .id) return error.ParseError;
+    if (std.ascii.isUpper(token.slice[0])) return error.ParseError;
+    if (std.mem.eql(u8, token.slice, "_")) return error.ParseError;
+    return .{ 1, token.slice };
+}
+
+const Atom = struct {
+    predicate: []const u8,
+    terms: []const Term = &[0]Term{},
+};
+
+fn parseAtom(from: []const Token, at: usize, allocator: std.mem.Allocator) !Consumed(Atom) {
+    if (from.len <= at) return error.ParseError;
+    _, const predicate = try parsePredicate(from, at);
+    var tokens: usize = 1;
+    if (at + tokens < from.len and from[at + tokens].t == .par_left) {
+        // Skip '('
+        tokens += 1;
+
+        if (from[at + tokens].t == .par_right) {
+            return .{ tokens, .{
+                .predicate = predicate,
+                .terms = &[0]Term{},
+            } };
+        }
+
+        var terms = std.ArrayList(Term).init(allocator);
+        errdefer terms.deinit();
+
+        const consumed0, const term0 = try parseTerm(from, at + tokens);
+        try terms.append(term0);
+        tokens += consumed0;
+
+        while (at + tokens < from.len) {
+            std.debug.print("at {}\n", .{from[at + tokens]});
+            if (from[at + tokens].t == .par_right) {
+                return .{ tokens, .{
+                    .predicate = predicate,
+                    .terms = try terms.toOwnedSlice(),
+                } };
+            }
+            if (from[at + tokens].t == .comma) {
+                // Skip comma
+                tokens += 1;
+                const consumed, const term = try parseTerm(from, at + tokens);
+                try terms.append(term);
+                tokens += consumed;
+            } else return error.ParseError;
+        } else return error.ParseError;
+    } else {
+        return .{ 1, .{ .predicate = predicate } };
+    }
+}
+
 test "Tokenize a basic datalog program" {
     var stream = TokenStream{
         .source_name = "test_buffer",
@@ -256,12 +345,11 @@ test "Tokenize a basic datalog program" {
         pr,
         dot,
     };
-    var idx: usize = 0;
-    while (try stream.next(struct {})) |token| {
-        const t, const s = expected[idx];
-        try std.testing.expect(token.t == t);
-        try std.testing.expect(std.mem.eql(u8, token.slice, s));
-        idx += 1;
+    const tokens = try stream.tokenize(std.testing.allocator);
+    defer std.testing.allocator.free(tokens);
+    for (expected, 0..) |expect, j| {
+        const t, const s = expect;
+        try std.testing.expect(tokens[j].t == t);
+        try std.testing.expect(std.mem.eql(u8, tokens[j].slice, s));
     }
-    try std.testing.expect(idx == expected.len);
 }

@@ -232,6 +232,7 @@ fn parseAtom(from: []const Token, at: usize, allocator: std.mem.Allocator) !Cons
         tokens += 1;
 
         if (from[at + tokens].t == .par_right) {
+            tokens += 1;
             return .{ tokens, .{
                 .predicate = predicate,
                 .terms = &[0]Term{},
@@ -246,8 +247,8 @@ fn parseAtom(from: []const Token, at: usize, allocator: std.mem.Allocator) !Cons
         tokens += consumed0;
 
         while (at + tokens < from.len) {
-            std.debug.print("at {}\n", .{from[at + tokens]});
             if (from[at + tokens].t == .par_right) {
+                tokens += 1;
                 return .{ tokens, .{
                     .predicate = predicate,
                     .terms = try terms.toOwnedSlice(),
@@ -263,6 +264,92 @@ fn parseAtom(from: []const Token, at: usize, allocator: std.mem.Allocator) !Cons
         } else return error.ParseError;
     } else {
         return .{ 1, .{ .predicate = predicate } };
+    }
+}
+
+const Rule = struct {
+    head: Atom,
+    body: []const Atom = &[0]Atom{},
+};
+
+fn parseRule(from: []const Token, at: usize, allocator: std.mem.Allocator) !Consumed(Rule) {
+    var consumed: usize = 0;
+    const consumed_head, const head = try parseAtom(from, at, allocator);
+    consumed += consumed_head;
+    if (at + consumed >= from.len) return error.ParseError;
+    switch (from[at + consumed].t) {
+        .dot => {
+            consumed += 1;
+            return .{ consumed, .{ .head = head } };
+        },
+        .when => {
+            consumed += 1;
+            var atoms = std.ArrayList(Atom).init(allocator);
+            errdefer atoms.deinit();
+            while (true) {
+                const consumed_atom, const atom = try parseAtom(from, at + consumed, allocator);
+                consumed += consumed_atom;
+                try atoms.append(atom);
+                if (at + consumed >= from.len) return error.ParseError;
+                switch (from[at + consumed].t) {
+                    .dot => {
+                        consumed += 1;
+                        return .{ consumed, .{ .head = head, .body = try atoms.toOwnedSlice() } };
+                    },
+                    .comma => {
+                        consumed += 1;
+                        continue;
+                    },
+                    else => return error.ParseError,
+                }
+            }
+        },
+        else => return error.ParseError,
+    }
+}
+
+fn parseProgram(from: []const Token, at: usize, allocator: std.mem.Allocator) !Consumed([]const Rule) {
+    var tokens: usize = 0;
+    var rules = std.ArrayList(Rule).init(allocator);
+    errdefer rules.deinit();
+    while (at + tokens < from.len) {
+        const consumed, const rule = try parseRule(from, at + tokens, allocator);
+        try rules.append(rule);
+        tokens += consumed;
+    }
+    return .{ tokens, try rules.toOwnedSlice() };
+}
+
+test "Parse a simple program" {
+    var stream = TokenStream{
+        .source_name = "test_buffer",
+        .source =
+        \\path(A, B) :- edge(A, B).
+        \\path(A, C) :- path(A, B), edge(B, C).
+        ,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const tokens = try stream.tokenize(arena.allocator());
+    _, const rules = try parseProgram(tokens, 0, arena.allocator());
+    {
+        const eql = std.mem.eql;
+        const expect = std.testing.expect;
+        try expect(eql(u8, rules[0].head.predicate, "path"));
+        try expect(eql(u8, rules[0].head.terms[0].variable, "A"));
+        try expect(eql(u8, rules[0].head.terms[1].variable, "B"));
+        try expect(eql(u8, rules[0].body[0].predicate, "edge"));
+        try expect(eql(u8, rules[0].body[0].terms[0].variable, "A"));
+        try expect(eql(u8, rules[0].body[0].terms[1].variable, "B"));
+        try expect(eql(u8, rules[1].head.predicate, "path"));
+        try expect(eql(u8, rules[1].head.terms[0].variable, "A"));
+        try expect(eql(u8, rules[1].head.terms[1].variable, "C"));
+        try expect(eql(u8, rules[1].body[0].predicate, "path"));
+        try expect(eql(u8, rules[1].body[0].terms[0].variable, "A"));
+        try expect(eql(u8, rules[1].body[0].terms[1].variable, "B"));
+        try expect(eql(u8, rules[1].body[1].predicate, "edge"));
+        try expect(eql(u8, rules[1].body[1].terms[0].variable, "B"));
+        try expect(eql(u8, rules[1].body[1].terms[1].variable, "C"));
     }
 }
 

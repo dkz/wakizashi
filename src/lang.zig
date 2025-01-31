@@ -2,6 +2,25 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
+const ArenaAllocator = std.heap.ArenaAllocator;
+
+pub fn parse(allocator: Allocator, source: []const u8) !ast.Program {
+    var arena = ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    {
+        const tokens = try tokenize(source, arena.allocator());
+        var parser = Parser{ .stream = tokens };
+        var rules = ArrayList(ast.Rule).init(arena.allocator());
+        while (!parser.eof()) {
+            const rule, parser = try parser.rule(arena.allocator());
+            try rules.append(rule);
+        }
+        return ast.Program{
+            .arena = arena,
+            .rules = try rules.toOwnedSlice(),
+        };
+    }
+}
 
 const ast = struct {
     const Term = union(enum) {
@@ -17,105 +36,162 @@ const ast = struct {
         head: Atom,
         body: ?[]const Atom = null,
     };
+    const Program = struct {
+        arena: ArenaAllocator,
+        rules: []const Rule,
+        fn destroy(self: *Program) void {
+            self.arena.deinit();
+        }
+    };
 };
 
-const parsers = struct {
+/// Scans through pre-allocated token stream and allocates an AST structure using allocator provided.
+/// Parsers are call-by-value, so fallback parser always stays up on stack for robust error reporting.
+const Parser = struct {
+    /// Combines typed parsing result with an immutable continuation of the parser.
     fn Result(comptime T: type) type {
-        return struct { usize, T };
+        return struct { T, Parser };
+    }
+    /// Current position of the parser in token's stream slice.
+    cursor: usize = 0,
+    stream: []const Token,
+
+    inline fn eof(self: Parser) bool {
+        return self.stream.len <= self.cursor;
     }
 
-    fn term(tokens: []const Token, at: usize) !Result(ast.Term) {
-        const this = tokens[at];
-        const next = 1 + at;
-        switch (this.t) {
-            .string => return .{ next, ast.Term{ .literal = this.slice } },
-            .identifier => {
-                if (std.mem.eql(u8, this.slice, "_")) return .{ next, ast.Term.wildcard };
-                if (std.ascii.isUpper(this.slice[0])) return .{ next, ast.Term{ .variable = this.slice } };
-                return .{ next, ast.Term{ .literal = this.slice } };
+    /// Pop token from the stream and bump cursor if stream has more tokens.
+    fn advance(self: Parser) ?Result(Token) {
+        if (self.eof()) return null;
+        return .{
+            self.stream[self.cursor],
+            .{
+                .stream = self.stream,
+                .cursor = self.cursor + 1,
             },
-            else => return error.ParseError,
-        }
+        };
     }
 
-    fn predicate(tokens: []const Token, at: usize) !Result([]const u8) {
-        const this = tokens[at];
-        const next = 1 + at;
-        if (this.t != .identifier) return error.ParseError;
-        if (std.ascii.isUpper(this.slice[0])) return error.ParseError;
-        if (std.mem.eql(u8, this.slice, "_")) return error.ParseError;
-        return .{ next, this.slice };
+    /// Pop token from the stream but only if it matches the token type.
+    fn lookup(self: Parser, t: Token.Type) ?Result(Token) {
+        var parser = self;
+        if (parser.advance()) |result| {
+            const token, parser = result;
+            return if (token.t == t) .{ token, parser } else null;
+        }
+        return null;
     }
 
-    fn atom(tokens: []const Token, cursor: usize, allocator: Allocator) !Result(ast.Atom) {
-        var at = cursor;
-        at, const pred = try predicate(tokens, at);
-        if (tokens[at].t != .parenthesis_left) return .{ at, ast.Atom{ .predicate = pred } };
-        at += 1;
-        if (tokens[at].t == .parenthesis_right) {
-            at += 1;
-            return .{ at, ast.Atom{ .predicate = pred } };
-        }
-        var terms = ArrayList(ast.Term).init(allocator);
-        errdefer terms.deinit();
-        {
-            at, const t = try term(tokens, at);
-            try terms.append(t);
-        }
-        while (at < tokens.len) {
-            if (tokens[at].t == .parenthesis_right) {
-                at += 1;
-                return .{
-                    at,
-                    ast.Atom{ .predicate = pred, .terms = try terms.toOwnedSlice() },
-                };
+    /// An identifier literal, a string literal, a variable or wildcard.
+    fn term(self: Parser) !Result(ast.Term) {
+        var parser = self;
+        if (self.lookup(.identifier)) |result| {
+            const token, parser = result;
+            if (std.mem.eql(u8, token.slice, "_")) {
+                return .{ ast.Term.wildcard, parser };
             }
-            if (tokens[at].t == .comma) {
-                at += 1;
-                at, const t = try term(tokens, at);
-                try terms.append(t);
-            } else return error.ParseError;
+            if (std.ascii.isUpper(token.slice[0])) {
+                return .{ ast.Term{ .variable = token.slice }, parser };
+            }
+            return .{ ast.Term{ .literal = token.slice }, parser };
+        }
+        if (self.lookup(.string)) |result| {
+            const token, parser = result;
+            return .{
+                ast.Term{ .literal = token.slice },
+                parser,
+            };
+        }
+        return error.ParserError;
+    }
+
+    /// Predicate symbol.
+    fn predicate(self: Parser) !Result([]const u8) {
+        var parser = self;
+        if (parser.lookup(.identifier)) |result| {
+            const token, parser = result;
+            if (std.ascii.isUpper(token.slice[0])) return error.ParseError;
+            if (std.mem.eql(u8, token.slice, "_")) return error.ParseError;
+            return .{ token.slice, parser };
         }
         return error.ParseError;
     }
 
-    fn rule(tokens: []const Token, cursor: usize, allocator: std.mem.Allocator) !Result(ast.Rule) {
-        var at = cursor;
-        at, const head = try atom(tokens, at, allocator);
-        switch (tokens[at].t) {
-            .dot => {
-                at += 1;
-                return .{ at, .{ .head = head } };
-            },
-            .implication => {
-                at += 1;
-                var atoms = ArrayList(ast.Atom).init(allocator);
-                errdefer atoms.deinit();
-                while (true) {
-                    at, const a = try atom(tokens, at, allocator);
-                    try atoms.append(a);
-                    switch (tokens[at].t) {
-                        .dot => {
-                            at += 1;
-                            return .{
-                                at,
-                                .{ .head = head, .body = try atoms.toOwnedSlice() },
-                            };
-                        },
-                        .comma => {
-                            at += 1;
-                            continue;
-                        },
-                        else => return error.ParseError,
-                    }
+    /// Atom consists of a predicate symbol and a list of terms in parenthesis.
+    fn atom(self: Parser, allocator: Allocator) !Result(ast.Atom) {
+        var parser = self;
+        const pred, parser = try parser.predicate();
+        if (parser.lookup(.parenthesis_left)) |parenthesis_left| {
+            _, parser = parenthesis_left;
+            if (parser.lookup(.parenthesis_right)) |parenthesis_right| {
+                _, parser = parenthesis_right;
+                return .{ ast.Atom{ .predicate = pred }, parser };
+            }
+            var terms = ArrayList(ast.Term).init(allocator);
+            errdefer terms.deinit();
+            {
+                const t, parser = try parser.term();
+                try terms.append(t);
+            }
+            while (parser.advance()) |result| {
+                const token, parser = result;
+                switch (token.t) {
+                    .parenthesis_right => {
+                        return .{
+                            ast.Atom{
+                                .predicate = pred,
+                                .terms = try terms.toOwnedSlice(),
+                            },
+                            parser,
+                        };
+                    },
+                    .comma => {
+                        const t, parser = try parser.term();
+                        try terms.append(t);
+                    },
+                    else => return error.ParseError,
                 }
-            },
-            else => return error.ParseError,
+            }
+            return error.ParseError;
+        } else {
+            return .{ ast.Atom{ .predicate = pred }, parser };
         }
+    }
+
+    /// Datalog rule.
+    fn rule(self: Parser, allocator: Allocator) !Result(ast.Rule) {
+        var parser = self;
+        const head, parser = try parser.atom(allocator);
+        if (parser.lookup(.dot)) |result| {
+            _, parser = result;
+            return .{ ast.Rule{ .head = head }, parser };
+        }
+        if (parser.lookup(.implication)) |implication| {
+            _, parser = implication;
+            var atoms = ArrayList(ast.Atom).init(allocator);
+            errdefer atoms.deinit();
+            while (true) {
+                const at, parser = try parser.atom(allocator);
+                try atoms.append(at);
+                if (parser.lookup(.dot)) |dot| {
+                    _, parser = dot;
+                    return .{
+                        ast.Rule{ .head = head, .body = try atoms.toOwnedSlice() },
+                        parser,
+                    };
+                }
+                if (parser.lookup(.comma)) |comma| {
+                    _, parser = comma;
+                    continue;
+                }
+                return error.ParseError;
+            }
+        }
+        return error.ParseError;
     }
 };
 
-test "Parsers" {
+test "Parsing" {
     const allocator = std.testing.allocator;
     const source =
         \\% Comment
@@ -126,7 +202,8 @@ test "Parsers" {
     {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        _, const rule = try parsers.rule(tokens, 0, arena.allocator());
+        const parser = Parser{ .stream = tokens, .cursor = 0 };
+        const rule, _ = try parser.rule(arena.allocator());
         try std.testing.expect(std.mem.eql(u8, rule.head.predicate, "path"));
         try std.testing.expect(std.mem.eql(u8, rule.head.terms.?[0].variable, "A"));
         try std.testing.expect(std.mem.eql(u8, rule.head.terms.?[1].variable, "B"));

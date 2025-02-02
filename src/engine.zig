@@ -3,6 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const HashMapUnmanaged = std.HashMapUnmanaged;
+const StringHashMap = std.StringHashMap;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
 const Predicate = struct {
@@ -41,6 +42,9 @@ const Constant = union(enum) {
                 break :string copy;
             } },
         }
+    }
+    fn eql(this: Constant, that: Constant) bool {
+        return std.mem.eql(u8, this.string, that.string);
     }
 };
 
@@ -186,6 +190,48 @@ const Db = struct {
             return null;
         }
     }
+    fn getFactsUnified(
+        self: *Db,
+        atom: Atom,
+        allocator: Allocator,
+        root: StringHashMap(Constant),
+    ) ![]*StringHashMap(Constant) {
+        var unified = ArrayList(*StringHashMap(Constant)).init(allocator);
+        errdefer unified.deinit();
+        if (self.getFacts(atom.predicate)) |db| {
+            fact: for (db) |fact| {
+                const bindings = try allocator.create(StringHashMap(Constant));
+                errdefer allocator.destroy(bindings);
+                bindings.* = try root.clone();
+                errdefer bindings.deinit();
+                for (atom.terms, fact.constants) |pattern, value| {
+                    switch (pattern) {
+                        .wildcard => {},
+                        .constant => |constant| {
+                            if (!Constant.eql(constant, value)) {
+                                bindings.deinit();
+                                allocator.destroy(bindings);
+                                continue :fact;
+                            }
+                        },
+                        .variable => |variable| {
+                            if (bindings.get(variable)) |existing| {
+                                if (!Constant.eql(existing, value)) {
+                                    bindings.deinit();
+                                    allocator.destroy(bindings);
+                                    continue :fact;
+                                }
+                            } else {
+                                try bindings.put(variable, value);
+                            }
+                        },
+                    }
+                }
+                try unified.append(bindings);
+            }
+        }
+        return unified.toOwnedSlice();
+    }
     fn addRule(
         self: *Db,
         predicate: Predicate,
@@ -224,68 +270,37 @@ const Db = struct {
     }
 };
 
-/// Populate facts with data allocated on stack to veiry copies work as intended.
-fn populate(db: *Db) !void {
+test "Basic unification" {
     const edge = Predicate{ .name = "edge", .arity = 2 };
     const x = Constant{ .string = "x" };
     const y = Constant{ .string = "y" };
     const z = Constant{ .string = "z" };
+    var db = Db.init(std.testing.allocator);
+    defer db.deinit();
     try db.addFact(edge, &[_]Constant{ x, y });
     try db.addFact(edge, &[_]Constant{ y, z });
-    const path = Predicate{ .name = "path", .arity = 2 };
-    try db.addRule(path, &[_]Variable{ "A", "B" }, &[_]Atom{Atom{
+    try db.addFact(edge, &[_]Constant{ z, z });
+    const atom = Atom{
         .predicate = edge,
         .terms = &[_]Term{
-            Term{ .variable = "A" },
-            Term{ .variable = "B" },
+            Term{ .variable = "?" },
+            Term{ .constant = z },
         },
-    }});
-    try db.addRule(path, &[_]Variable{ "A", "B" }, &[_]Atom{
-        Atom{
-            .predicate = edge,
-            .terms = &[_]Term{
-                Term{ .variable = "A" },
-                Term{ .variable = "C" },
-            },
-        },
-        Atom{
-            .predicate = path,
-            .terms = &[_]Term{
-                Term{ .variable = "C" },
-                Term{ .variable = "B" },
-            },
-        },
-    });
-}
-test "Db ownership" {
-    var db: Db = Db.init(std.testing.allocator);
-    defer db.deinit();
-    try populate(&db);
-    if (db.getFacts(.{ .name = "edge", .arity = 2 })) |facts| {
-        for (facts) |f| {
-            std.debug.print(
-                "edge({s}, {s}).\n",
-                .{
-                    f.constants[0].string,
-                    f.constants[1].string,
-                },
-            );
-        }
-    }
-    if (db.getRules(.{ .name = "path", .arity = 2 })) |rules| {
-        for (rules) |r| {
-            std.debug.print("path({s}, {s}) :-\n", .{
-                r.variables[0],
-                r.variables[1],
+    };
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var root = StringHashMap(Constant).init(allocator);
+    defer root.deinit();
+    const unified = try db.getFactsUnified(atom, allocator, root);
+    for (unified) |bindings| {
+        var it = bindings.iterator();
+        std.debug.print("Unified {}:\n", .{bindings.count()});
+        while (it.next()) |bind| {
+            std.debug.print("\t{s}: {s}\n", .{
+                bind.key_ptr.*,
+                bind.value_ptr.*.string,
             });
-            for (r.atoms) |a| {
-                std.debug.print("\t{s}({s}, {s})\n", .{
-                    a.predicate.name,
-                    a.terms[0].variable,
-                    a.terms[1].variable,
-                });
-            }
-            std.debug.print(".\n", .{});
         }
     }
 }

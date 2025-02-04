@@ -3,7 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const HashMapUnmanaged = std.HashMapUnmanaged;
-const StringHashMap = std.StringHashMap;
+const StringHashMapUnmanaged = std.StringHashMapUnmanaged;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
 const Predicate = struct {
@@ -138,6 +138,39 @@ const Rule = struct {
     }
 };
 
+fn Queue(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const Backend = std.DoublyLinkedList(T);
+        backend: Backend,
+        allocator: Allocator,
+        fn init(allocator: Allocator) Self {
+            return .{
+                .allocator = allocator,
+                .backend = .{},
+            };
+        }
+        fn append(self: *Self, elem: T) !void {
+            const node = try self.allocator.create(Backend.Node);
+            node.* = .{ .data = elem };
+            self.backend.append(node);
+        }
+        fn pop(self: *Self) ?T {
+            const first = self.backend.popFirst();
+            if (first) |node| {
+                const data = node.data;
+                self.allocator.destroy(node);
+                return data;
+            } else {
+                return null;
+            }
+        }
+        fn deinit(self: *Self) void {
+            while (self.pop()) {}
+        }
+    };
+}
+
 const Db = struct {
     const load_percentage = std.hash_map.default_max_load_percentage;
     const FactDb = HashMapUnmanaged(
@@ -193,23 +226,21 @@ const Db = struct {
     fn getFactsUnified(
         self: *Db,
         atom: Atom,
-        allocator: Allocator,
-        root: StringHashMap(Constant),
-    ) ![]*StringHashMap(Constant) {
-        var unified = ArrayList(*StringHashMap(Constant)).init(allocator);
-        errdefer unified.deinit();
+        root: *StringHashMapUnmanaged(Constant),
+        into: *ArrayList(*StringHashMapUnmanaged(Constant)),
+        arena: *ArenaAllocator,
+    ) !void {
+        const allocator = arena.allocator();
         if (self.getFacts(atom.predicate)) |db| {
             fact: for (db) |fact| {
-                const bindings = try allocator.create(StringHashMap(Constant));
-                errdefer allocator.destroy(bindings);
-                bindings.* = try root.clone();
-                errdefer bindings.deinit();
+                const bindings = try allocator.create(StringHashMapUnmanaged(Constant));
+                bindings.* = try root.clone(allocator);
                 for (atom.terms, fact.constants) |pattern, value| {
                     switch (pattern) {
                         .wildcard => {},
                         .constant => |constant| {
                             if (!Constant.eql(constant, value)) {
-                                bindings.deinit();
+                                bindings.deinit(allocator);
                                 allocator.destroy(bindings);
                                 continue :fact;
                             }
@@ -217,20 +248,56 @@ const Db = struct {
                         .variable => |variable| {
                             if (bindings.get(variable)) |existing| {
                                 if (!Constant.eql(existing, value)) {
-                                    bindings.deinit();
+                                    bindings.deinit(allocator);
                                     allocator.destroy(bindings);
                                     continue :fact;
                                 }
                             } else {
-                                try bindings.put(variable, value);
+                                try bindings.put(allocator, variable, value);
                             }
                         },
                     }
                 }
-                try unified.append(bindings);
+                try into.append(bindings);
             }
         }
-        return unified.toOwnedSlice();
+    }
+    fn getInfered(
+        self: *Db,
+        rule: Rule,
+        into: *ArrayList(Fact),
+        arena: *ArenaAllocator,
+    ) !void {
+        const InferenceState = struct { *StringHashMapUnmanaged(Constant), []const Atom };
+        const allocator = arena.allocator();
+        var queue = Queue(InferenceState).init(allocator);
+        const root = try allocator.create(StringHashMapUnmanaged(Constant));
+        root.* = .{};
+        try queue.append(.{ root, rule.atoms });
+        while (queue.pop()) |state| {
+            const bindings, const atoms = state;
+            if (atoms.len == 0) {
+                const constants = try allocator.alloc(Constant, rule.variables.len);
+                for (rule.variables, 0..) |variable, index| {
+                    constants[index] = bindings.get(variable).?;
+                }
+                try into.append(.{ .constants = constants });
+            } else {
+                var unified = ArrayList(*StringHashMapUnmanaged(Constant)).init(allocator);
+                defer unified.deinit();
+                try self.getFactsUnified(
+                    atoms[0],
+                    bindings,
+                    &unified,
+                    arena,
+                );
+                for (unified.items) |candidate| {
+                    try queue.append(.{ candidate, atoms[1..] });
+                }
+            }
+            bindings.deinit(allocator);
+            allocator.destroy(bindings);
+        }
     }
     fn addRule(
         self: *Db,
@@ -270,7 +337,7 @@ const Db = struct {
     }
 };
 
-test "Basic unification" {
+test "Basic inference" {
     const edge = Predicate{ .name = "edge", .arity = 2 };
     const x = Constant{ .string = "x" };
     const y = Constant{ .string = "y" };
@@ -279,28 +346,36 @@ test "Basic unification" {
     defer db.deinit();
     try db.addFact(edge, &[_]Constant{ x, y });
     try db.addFact(edge, &[_]Constant{ y, z });
-    try db.addFact(edge, &[_]Constant{ z, z });
-    const atom = Atom{
+    const path = Predicate{ .name = "path", .arity = 2 };
+    try db.addRule(path, &[_]Variable{ "A", "C" }, &[_]Atom{ Atom{
         .predicate = edge,
         .terms = &[_]Term{
-            Term{ .variable = "?" },
-            Term{ .constant = z },
+            Term{ .variable = "A" },
+            Term{ .variable = "B" },
         },
-    };
+    }, Atom{
+        .predicate = edge,
+        .terms = &[_]Term{
+            Term{ .variable = "B" },
+            Term{ .variable = "C" },
+        },
+    } });
     var arena = ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const allocator = arena.allocator();
-    var root = StringHashMap(Constant).init(allocator);
-    defer root.deinit();
-    const unified = try db.getFactsUnified(atom, allocator, root);
-    for (unified) |bindings| {
-        var it = bindings.iterator();
-        std.debug.print("Unified {}:\n", .{bindings.count()});
-        while (it.next()) |bind| {
-            std.debug.print("\t{s}: {s}\n", .{
-                bind.key_ptr.*,
-                bind.value_ptr.*.string,
-            });
+    const out = std.io.getStdErr().writer();
+    if (db.getRules(path)) |rules| {
+        for (rules) |rule| {
+            var inferred = ArrayList(Fact).init(arena.allocator());
+            defer inferred.deinit();
+            try db.getInfered(
+                rule,
+                &inferred,
+                &arena,
+            );
+            for (inferred.items) |fact| {
+                try std.json.stringify(fact, .{}, out);
+                try out.writeAll("\n");
+            }
         }
     }
 }

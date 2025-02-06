@@ -22,28 +22,112 @@ pub fn parse(allocator: Allocator, source: []const u8) !ast.Program {
     }
 }
 
-const ast = struct {
-    const Term = union(enum) {
+const Literal = []const u8;
+
+pub const ast = struct {
+    pub const Term = union(enum) {
         wildcard,
-        literal: []const u8,
-        variable: []const u8,
+        literal: Literal,
+        variable: Literal,
     };
-    const Atom = struct {
-        predicate: []const u8,
+    pub const Atom = struct {
+        predicate: Literal,
         terms: ?[]const Term = null,
     };
-    const Rule = struct {
+    pub const Rule = struct {
         head: Atom,
         body: ?[]const Atom = null,
     };
-    const Program = struct {
+    pub const Program = struct {
         arena: ArenaAllocator,
         rules: []const Rule,
-        fn destroy(self: *Program) void {
+        pub fn destroy(self: *Program) void {
             self.arena.deinit();
         }
     };
 };
+
+pub const SemanticalRule = union(enum) {
+    fact: struct { predicate: Literal, terms: []const Literal },
+    rule: struct {
+        predicate: Literal,
+        variables: []const Literal,
+        atoms: ?[]const ast.Atom,
+    },
+};
+
+/// TODO No idea how to even name this function.
+/// It validates the ast and produces a grammatically corrent structure,
+/// rather than syntaxically correct one.
+fn semantical(rule: ast.Rule, allocator: Allocator) !SemanticalRule {
+    var constants = ArrayList(Literal).init(allocator);
+    errdefer constants.deinit();
+    var variables = ArrayList(Literal).init(allocator);
+    errdefer variables.deinit();
+    if (rule.head.terms) |terms| {
+        for (terms) |head| switch (head) {
+            // Wildcard can't reappear in the right hand side of the rule:
+            .wildcard => return error.ParseError,
+            .literal => |it| try constants.append(it),
+            .variable => |it| try variables.append(it),
+        };
+    }
+    // Unbound variables do not appear in the right hand side:
+    var unbound = try variables.clone();
+    if (rule.body) |body| {
+        atoms: for (body) |atom| {
+            _ = atom.terms orelse continue :atoms;
+            for (atom.terms.?) |t| switch (t) {
+                .variable => |it| {
+                    for (unbound.items, 0..) |v, j| {
+                        if (std.mem.eql(u8, v, it)) {
+                            _ = unbound.swapRemove(j);
+                        }
+                    }
+                },
+                else => {},
+            };
+        }
+        if (unbound.items.len > 0) return error.ParseError;
+        constants.deinit();
+        return SemanticalRule{ .rule = .{
+            .predicate = rule.head.predicate,
+            .variables = try variables.toOwnedSlice(),
+            .atoms = rule.body,
+        } };
+    } else {
+        if (variables.items.len > 0) return error.ParseError;
+        variables.deinit();
+        return SemanticalRule{
+            .fact = .{
+                .predicate = rule.head.predicate,
+                .terms = try constants.toOwnedSlice(),
+            },
+        };
+    }
+}
+
+test "Semantic Rule" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\path(A, B) :- edge(A, B).
+        \\fact('one', 'two').
+    ;
+    var program = try parse(allocator, source);
+    defer program.destroy();
+    var arena = ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.json.stringify(
+        try semantical(program.rules[0], arena.allocator()),
+        .{ .whitespace = .indent_2 },
+        std.io.getStdErr().writer(),
+    );
+    try std.json.stringify(
+        try semantical(program.rules[1], arena.allocator()),
+        .{ .whitespace = .indent_2 },
+        std.io.getStdErr().writer(),
+    );
+}
 
 /// Scans through pre-allocated token stream and allocates an AST structure using allocator provided.
 /// Parsers are call-by-value, so fallback parser always stays up on stack for robust error reporting.

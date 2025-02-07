@@ -1,26 +1,9 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
-const ArrayList = std.ArrayList;
 const ArenaAllocator = std.heap.ArenaAllocator;
-
-pub fn parse(allocator: Allocator, source: []const u8) !ast.Program {
-    var arena = ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    {
-        const tokens = try tokenize(source, arena.allocator());
-        var parser = Parser{ .stream = tokens };
-        var rules = ArrayList(ast.Rule).init(arena.allocator());
-        while (!parser.eof()) {
-            const rule, parser = try parser.rule(arena.allocator());
-            try rules.append(rule);
-        }
-        return ast.Program{
-            .arena = arena,
-            .rules = try rules.toOwnedSlice(),
-        };
-    }
-}
+const DynamicBitSet = std.bit_set.DynamicBitSet;
+const ArrayList = std.ArrayList;
 
 const Literal = []const u8;
 
@@ -33,97 +16,139 @@ pub const ast = struct {
     pub const Atom = struct {
         predicate: Literal,
         terms: ?[]const Term = null,
+        token: u32,
     };
     pub const Rule = struct {
         head: Atom,
         body: ?[]const Atom = null,
+        token: u32,
     };
     pub const Program = struct {
         arena: ArenaAllocator,
+        tokens: []const Token,
         rules: []const Rule,
-        pub fn destroy(self: *Program) void {
-            self.arena.deinit();
-        }
     };
-};
 
-pub const SemanticalRule = union(enum) {
-    fact: struct { predicate: Literal, terms: []const Literal },
-    rule: struct {
-        predicate: Literal,
-        variables: []const Literal,
-        atoms: ?[]const ast.Atom,
-    },
-};
-
-/// TODO No idea how to even name this function.
-/// It validates the ast and produces a grammatically corrent structure,
-/// rather than syntaxically correct one.
-fn semantical(rule: ast.Rule, allocator: Allocator) !SemanticalRule {
-    var constants = ArrayList(Literal).init(allocator);
-    errdefer constants.deinit();
-    var variables = ArrayList(Literal).init(allocator);
-    errdefer variables.deinit();
-    if (rule.head.terms) |terms| {
-        for (terms) |head| switch (head) {
-            // Wildcard can't reappear in the right hand side of the rule:
-            .wildcard => return error.ParseError,
-            .literal => |it| try constants.append(it),
-            .variable => |it| try variables.append(it),
+    pub fn parse(source: []const u8, allocator: Allocator) !Program {
+        var arena = ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const tokens = try tokenize(source, arena.allocator());
+        var parser = Parser{ .stream = tokens };
+        var rules = ArrayList(ast.Rule).init(arena.allocator());
+        while (!parser.eof()) {
+            const rule, parser = try parser.rule(arena.allocator());
+            try rules.append(rule);
+        }
+        return Program{
+            .arena = arena,
+            .tokens = tokens,
+            .rules = try rules.toOwnedSlice(),
         };
     }
-    // Unbound variables do not appear in the right hand side:
-    var unbound = try variables.clone();
-    if (rule.body) |body| {
-        atoms: for (body) |atom| {
-            _ = atom.terms orelse continue :atoms;
-            for (atom.terms.?) |t| switch (t) {
-                .variable => |it| {
-                    for (unbound.items, 0..) |v, j| {
-                        if (std.mem.eql(u8, v, it)) {
-                            _ = unbound.swapRemove(j);
-                        }
-                    }
+};
+
+pub const data = struct {
+    pub const TupleElement = union(enum) {
+        variable: Literal,
+        constant: Literal,
+    };
+
+    pub const Statement = union(enum) {
+        fact: struct {
+            predicate: Literal,
+            tuple: ?[]const Literal = null,
+        },
+        rule: struct {
+            predicate: Literal,
+            tuple: ?[]const TupleElement = null,
+            atoms: ?[]const ast.Atom = null,
+        },
+    };
+
+    pub fn parse(rule: ast.Rule, allocator: Allocator) !Statement {
+        const rule_predicate = rule.head.predicate;
+        const rule_implies = if (rule.body) |body| body.len > 0 else false;
+        const rule_states = if (rule.head.terms) |terms| terms.len > 0 else false;
+        if (!rule_implies) {
+            if (!rule_states) {
+                return Statement{ .fact = .{ .predicate = rule_predicate } };
+            }
+            var tuple = ArrayList(Literal).init(allocator);
+            errdefer tuple.deinit();
+            for (rule.head.terms.?) |term| switch (term) {
+                .literal => |it| try tuple.append(it),
+                else => return error.ParseError,
+            };
+            return Statement{
+                .fact = .{
+                    .predicate = rule_predicate,
+                    .tuple = try tuple.toOwnedSlice(),
                 },
-                else => {},
+            };
+        } else {
+            if (!rule_states) {
+                return Statement{ .rule = .{ .predicate = rule_predicate, .atoms = rule.body } };
+            }
+            const head = rule.head.terms.?;
+            var tuple = ArrayList(TupleElement).init(allocator);
+            errdefer tuple.deinit();
+            var unbound = try DynamicBitSet.initEmpty(allocator, head.len);
+            defer unbound.deinit();
+            for (head, 0..) |term, idx| switch (term) {
+                .wildcard => return error.ParseError,
+                .literal => |it| {
+                    try tuple.append(TupleElement{ .constant = it });
+                },
+                .variable => |it| {
+                    try tuple.append(TupleElement{ .variable = it });
+                    unbound.set(idx);
+                },
+            };
+            atom: for (rule.body.?) |atom| {
+                _ = atom.terms orelse continue :atom;
+                for (atom.terms.?) |term| switch (term) {
+                    .variable => |this| {
+                        for (tuple.items, 0..) |t, idx| switch (t) {
+                            .variable => |that| {
+                                if (std.mem.eql(u8, this, that)) {
+                                    unbound.unset(idx);
+                                }
+                            },
+                            else => {},
+                        };
+                    },
+                    else => {},
+                };
+            }
+            if (unbound.count() > 0) return error.ParseError;
+            return Statement{
+                .rule = .{
+                    .predicate = rule_predicate,
+                    .tuple = try tuple.toOwnedSlice(),
+                    .atoms = rule.body,
+                },
             };
         }
-        if (unbound.items.len > 0) return error.ParseError;
-        constants.deinit();
-        return SemanticalRule{ .rule = .{
-            .predicate = rule.head.predicate,
-            .variables = try variables.toOwnedSlice(),
-            .atoms = rule.body,
-        } };
-    } else {
-        if (variables.items.len > 0) return error.ParseError;
-        variables.deinit();
-        return SemanticalRule{
-            .fact = .{
-                .predicate = rule.head.predicate,
-                .terms = try constants.toOwnedSlice(),
-            },
-        };
     }
-}
+};
 
-test "Semantic Rule" {
+test "Data" {
     const allocator = std.testing.allocator;
     const source =
         \\path(A, B) :- edge(A, B).
         \\fact('one', 'two').
     ;
-    var program = try parse(allocator, source);
-    defer program.destroy();
+    var program = try ast.parse(source, allocator);
+    defer program.arena.deinit();
     var arena = ArenaAllocator.init(allocator);
     defer arena.deinit();
     try std.json.stringify(
-        try semantical(program.rules[0], arena.allocator()),
+        try data.parse(program.rules[0], arena.allocator()),
         .{ .whitespace = .indent_2 },
         std.io.getStdErr().writer(),
     );
     try std.json.stringify(
-        try semantical(program.rules[1], arena.allocator()),
+        try data.parse(program.rules[1], arena.allocator()),
         .{ .whitespace = .indent_2 },
         std.io.getStdErr().writer(),
     );
@@ -137,7 +162,7 @@ const Parser = struct {
         return struct { T, Parser };
     }
     /// Current position of the parser in token's stream slice.
-    cursor: usize = 0,
+    cursor: u32 = 0,
     stream: []const Token,
 
     inline fn eof(self: Parser) bool {
@@ -209,7 +234,7 @@ const Parser = struct {
             _, parser = parenthesis_left;
             if (parser.lookup(.parenthesis_right)) |parenthesis_right| {
                 _, parser = parenthesis_right;
-                return .{ ast.Atom{ .predicate = pred }, parser };
+                return .{ ast.Atom{ .token = self.cursor, .predicate = pred }, parser };
             }
             var terms = ArrayList(ast.Term).init(allocator);
             errdefer terms.deinit();
@@ -223,6 +248,7 @@ const Parser = struct {
                     .parenthesis_right => {
                         return .{
                             ast.Atom{
+                                .token = self.cursor,
                                 .predicate = pred,
                                 .terms = try terms.toOwnedSlice(),
                             },
@@ -238,7 +264,7 @@ const Parser = struct {
             }
             return error.ParseError;
         } else {
-            return .{ ast.Atom{ .predicate = pred }, parser };
+            return .{ ast.Atom{ .token = self.cursor, .predicate = pred }, parser };
         }
     }
 
@@ -248,7 +274,10 @@ const Parser = struct {
         const head, parser = try parser.atom(allocator);
         if (parser.lookup(.dot)) |result| {
             _, parser = result;
-            return .{ ast.Rule{ .head = head }, parser };
+            return .{ ast.Rule{
+                .token = self.cursor,
+                .head = head,
+            }, parser };
         }
         if (parser.lookup(.implication)) |implication| {
             _, parser = implication;
@@ -260,7 +289,11 @@ const Parser = struct {
                 if (parser.lookup(.dot)) |dot| {
                     _, parser = dot;
                     return .{
-                        ast.Rule{ .head = head, .body = try atoms.toOwnedSlice() },
+                        ast.Rule{
+                            .token = self.cursor,
+                            .head = head,
+                            .body = try atoms.toOwnedSlice(),
+                        },
                         parser,
                     };
                 }

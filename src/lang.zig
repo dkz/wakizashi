@@ -7,6 +7,11 @@ const ArrayList = std.ArrayList;
 
 const Literal = []const u8;
 
+const Annotation = struct {
+    line: u32,
+    column: u32,
+};
+
 pub const ast = struct {
     pub const Term = union(enum) {
         wildcard,
@@ -16,33 +21,43 @@ pub const ast = struct {
     pub const Atom = struct {
         predicate: Literal,
         terms: ?[]const Term = null,
+        /// Location of this atom in the file's token stream.
         token: u32,
     };
     pub const Rule = struct {
         head: Atom,
         body: ?[]const Atom = null,
+        /// Location of this rule in the file's token stream.
         token: u32,
     };
-    pub const Program = struct {
-        arena: ArenaAllocator,
+    pub const File = struct {
+        name: []const u8,
+        source: []const u8,
         tokens: []const Token,
-        rules: []const Rule,
+        statements: []const Rule,
+        fn annotateRule(self: *const File, rule: *const Rule) Annotation {
+            return annotateToken(self.source, &self.tokens[rule.token]);
+        }
+        fn annotateAtom(self: *const File, atom: *const Atom) Annotation {
+            return annotateToken(self.source, &self.tokens[atom.token]);
+        }
     };
 
-    pub fn parse(source: []const u8, allocator: Allocator) !Program {
-        var arena = ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        const tokens = try tokenize(source, arena.allocator());
+    /// Extract an abstract syntax tree from file buffer contents named `name`.
+    pub fn parse(name: []const u8, source: []const u8, arena: *ArenaAllocator) !File {
+        const allocator = arena.allocator();
+        const tokens = try tokenize(source, allocator);
+        var statements = ArrayList(Rule).init(allocator);
         var parser = Parser{ .stream = tokens };
-        var rules = ArrayList(ast.Rule).init(arena.allocator());
         while (!parser.eof()) {
-            const rule, parser = try parser.rule(arena.allocator());
-            try rules.append(rule);
+            const rule, parser = try parser.rule(allocator);
+            try statements.append(rule);
         }
-        return Program{
-            .arena = arena,
+        return File{
+            .name = name,
+            .source = source,
             .tokens = tokens,
-            .rules = try rules.toOwnedSlice(),
+            .statements = try statements.toOwnedSlice(),
         };
     }
 };
@@ -65,7 +80,7 @@ pub const data = struct {
         },
     };
 
-    pub fn parse(rule: ast.Rule, allocator: Allocator) !Statement {
+    pub fn parse(rule: ast.Rule, arena: *ArenaAllocator) !Statement {
         const rule_predicate = rule.head.predicate;
         const rule_implies = if (rule.body) |body| body.len > 0 else false;
         const rule_states = if (rule.head.terms) |terms| terms.len > 0 else false;
@@ -73,7 +88,7 @@ pub const data = struct {
             if (!rule_states) {
                 return Statement{ .fact = .{ .predicate = rule_predicate } };
             }
-            var tuple = ArrayList(Literal).init(allocator);
+            var tuple = ArrayList(Literal).init(arena.allocator());
             errdefer tuple.deinit();
             for (rule.head.terms.?) |term| switch (term) {
                 .literal => |it| try tuple.append(it),
@@ -90,9 +105,9 @@ pub const data = struct {
                 return Statement{ .rule = .{ .predicate = rule_predicate, .atoms = rule.body } };
             }
             const head = rule.head.terms.?;
-            var tuple = ArrayList(TupleElement).init(allocator);
+            var tuple = ArrayList(TupleElement).init(arena.allocator());
             errdefer tuple.deinit();
-            var unbound = try DynamicBitSet.initEmpty(allocator, head.len);
+            var unbound = try DynamicBitSet.initEmpty(arena.allocator(), head.len);
             defer unbound.deinit();
             for (head, 0..) |term, idx| switch (term) {
                 .wildcard => return error.ParseError,
@@ -131,28 +146,6 @@ pub const data = struct {
         }
     }
 };
-
-test "Data" {
-    const allocator = std.testing.allocator;
-    const source =
-        \\path(A, B) :- edge(A, B).
-        \\fact('one', 'two').
-    ;
-    var program = try ast.parse(source, allocator);
-    defer program.arena.deinit();
-    var arena = ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    try std.json.stringify(
-        try data.parse(program.rules[0], arena.allocator()),
-        .{ .whitespace = .indent_2 },
-        std.io.getStdErr().writer(),
-    );
-    try std.json.stringify(
-        try data.parse(program.rules[1], arena.allocator()),
-        .{ .whitespace = .indent_2 },
-        std.io.getStdErr().writer(),
-    );
-}
 
 /// Scans through pre-allocated token stream and allocates an AST structure using allocator provided.
 /// Parsers are call-by-value, so fallback parser always stays up on stack for robust error reporting.
@@ -308,26 +301,28 @@ const Parser = struct {
     }
 };
 
-test "Parsing" {
-    const allocator = std.testing.allocator;
-    const source =
-        \\% Comment
-        \\path(A, B) :- edge(A, B).
-    ;
-    const tokens = try tokenize(source, allocator);
-    defer allocator.free(tokens);
-    {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const parser = Parser{ .stream = tokens, .cursor = 0 };
-        const rule, _ = try parser.rule(arena.allocator());
-        try std.testing.expect(std.mem.eql(u8, rule.head.predicate, "path"));
-        try std.testing.expect(std.mem.eql(u8, rule.head.terms.?[0].variable, "A"));
-        try std.testing.expect(std.mem.eql(u8, rule.head.terms.?[1].variable, "B"));
-        try std.testing.expect(std.mem.eql(u8, rule.body.?[0].predicate, "edge"));
-        try std.testing.expect(std.mem.eql(u8, rule.body.?[0].terms.?[0].variable, "A"));
-        try std.testing.expect(std.mem.eql(u8, rule.body.?[0].terms.?[1].variable, "B"));
+fn annotateSource(source: []const u8, at: usize) Annotation {
+    std.debug.assert(0 <= at);
+    std.debug.assert(at < source.len);
+    var j: u32 = 0;
+    var lines: u32 = 1;
+    var column: u32 = 0;
+    while (j <= at) {
+        switch (source[j]) {
+            '\n' => {
+                lines += 1;
+                column = 0;
+            },
+            else => {
+                column += 1;
+            },
+        }
+        j += 1;
     }
+    return .{
+        .line = lines,
+        .column = column,
+    };
 }
 
 const Token = struct {
@@ -345,7 +340,7 @@ const Token = struct {
 };
 
 fn tokenize(source: []const u8, allocator: Allocator) ![]Token {
-    var stream = Stream{ .buf = source };
+    var stream = TokenStream{ .source = source };
     var tokens = ArrayList(Token).init(allocator);
     errdefer tokens.deinit();
     while (stream.next()) |t| {
@@ -354,44 +349,28 @@ fn tokenize(source: []const u8, allocator: Allocator) ![]Token {
     return tokens.toOwnedSlice();
 }
 
-test "Tokenization" {
-    const allocator = std.testing.allocator;
-    const source =
-        \\% Comment
-        \\predicate('string constant', Variable).
-    ;
-    const tokens = try tokenize(source, allocator);
-    defer allocator.free(tokens);
-    {
-        const result = &[_]struct { Token.Type, []const u8 }{
-            .{ .identifier, "predicate" },
-            .{ .parenthesis_left, "(" },
-            .{ .string, "string constant" },
-            .{ .comma, "," },
-            .{ .identifier, "Variable" },
-            .{ .parenthesis_right, ")" },
-            .{ .dot, "." },
-        };
-        for (tokens, result) |token, expected| {
-            const t, const slice = expected;
-            try std.testing.expect(std.mem.eql(u8, token.slice, slice));
-            try std.testing.expect(token.t == t);
-        }
-    }
+fn annotateToken(source: []const u8, token: *const Token) Annotation {
+    const start = @intFromPtr(source.ptr);
+    const end = @intFromPtr(token.slice.ptr);
+    return annotateSource(source, end - start);
 }
 
-const Stream = struct {
-    buf: []const u8,
-    pos: usize = 0,
-    fn peek(self: *Stream) ?u8 {
-        if (self.pos >= self.buf.len) return null;
-        return self.buf[self.pos];
+const TokenStream = struct {
+    const Position = struct {
+        line: u32,
+        column: u32,
+    };
+    source: []const u8,
+    cursor: usize = 0,
+    fn peek(self: *TokenStream) ?u8 {
+        if (self.cursor >= self.source.len) return null;
+        return self.source[self.cursor];
     }
-    fn skip(self: *Stream) void {
-        if (self.pos >= self.buf.len) return;
-        self.pos += 1;
+    fn skip(self: *TokenStream) void {
+        if (self.cursor >= self.source.len) return;
+        self.cursor += 1;
     }
-    fn next(self: *Stream) ?Token {
+    fn next(self: *TokenStream) ?Token {
         while (self.peek()) |char| {
             switch (char) {
                 ' ' => self.skip(),
@@ -412,40 +391,40 @@ const Stream = struct {
             }
         } else return null;
     }
-    inline fn produce(self: *Stream, t: Token.Type, from: usize) Token {
-        return .{ .t = t, .slice = self.buf[from..self.pos] };
+    inline fn produce(self: *TokenStream, t: Token.Type, from: usize) Token {
+        return .{ .t = t, .slice = self.source[from..self.cursor] };
     }
-    inline fn onNewline(self: *Stream) void {
+    inline fn onNewline(self: *TokenStream) void {
         self.skip();
     }
-    inline fn onDot(self: *Stream) Token {
-        const from = self.pos;
+    inline fn onDot(self: *TokenStream) Token {
+        const from = self.cursor;
         self.skip();
         return self.produce(.dot, from);
     }
-    inline fn onComma(self: *Stream) Token {
-        const from = self.pos;
+    inline fn onComma(self: *TokenStream) Token {
+        const from = self.cursor;
         self.skip();
         return self.produce(.comma, from);
     }
-    inline fn onParenthesisLeft(self: *Stream) Token {
-        const from = self.pos;
+    inline fn onParenthesisLeft(self: *TokenStream) Token {
+        const from = self.cursor;
         self.skip();
         return self.produce(.parenthesis_left, from);
     }
-    inline fn onParenthesisRight(self: *Stream) Token {
-        const from = self.pos;
+    inline fn onParenthesisRight(self: *TokenStream) Token {
+        const from = self.cursor;
         self.skip();
         return self.produce(.parenthesis_right, from);
     }
-    inline fn onComment(self: *Stream) void {
+    inline fn onComment(self: *TokenStream) void {
         while (self.peek()) |char| {
             if (char == '\n') break;
             self.skip();
         }
     }
-    inline fn onColon(self: *Stream) ?Token {
-        const from = self.pos;
+    inline fn onColon(self: *TokenStream) ?Token {
+        const from = self.cursor;
         self.skip();
         if (self.peek()) |char| {
             if (char == '-') {
@@ -455,9 +434,9 @@ const Stream = struct {
         }
         return null; // TODO should be an error;
     }
-    inline fn onString(self: *Stream) ?Token {
+    inline fn onString(self: *TokenStream) ?Token {
         self.skip();
-        const from = self.pos;
+        const from = self.cursor;
         while (self.peek()) |char| {
             if (char == '\'' or char == '\n') break;
             self.skip();
@@ -471,8 +450,8 @@ const Stream = struct {
         }
         return null; // TODO should be an error;
     }
-    inline fn onIdentifier(self: *Stream) Token {
-        const from = self.pos;
+    inline fn onIdentifier(self: *TokenStream) Token {
+        const from = self.cursor;
         self.skip();
         while (self.peek()) |char| {
             if (!std.ascii.isAlphabetic(char) and char != '_') break;

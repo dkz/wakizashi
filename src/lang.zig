@@ -5,9 +5,9 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const DynamicBitSet = std.bit_set.DynamicBitSet;
 const ArrayList = std.ArrayList;
 
-const Literal = []const u8;
+pub const Literal = []const u8;
 
-const Annotation = struct {
+pub const Annotation = struct {
     line: u32,
     column: u32,
 };
@@ -19,14 +19,16 @@ pub const ast = struct {
         variable: Literal,
     };
     pub const Atom = struct {
+        const nullary: []const Term = &[0]Term{};
         predicate: Literal,
-        terms: ?[]const Term = null,
+        terms: []const Term = nullary,
         /// Location of this atom in the file's token stream.
         token: u32,
     };
     pub const Rule = struct {
+        const empty: []const Atom = &[0]Atom{};
         head: Atom,
-        body: ?[]const Atom = null,
+        body: []const Atom = empty,
         /// Location of this rule in the file's token stream.
         token: u32,
     };
@@ -35,10 +37,10 @@ pub const ast = struct {
         source: []const u8,
         tokens: []const Token,
         statements: []const Rule,
-        fn annotateRule(self: *const File, rule: *const Rule) Annotation {
+        pub fn annotateRule(self: *const File, rule: *const Rule) Annotation {
             return annotateToken(self.source, &self.tokens[rule.token]);
         }
-        fn annotateAtom(self: *const File, atom: *const Atom) Annotation {
+        pub fn annotateAtom(self: *const File, atom: *const Atom) Annotation {
             return annotateToken(self.source, &self.tokens[atom.token]);
         }
     };
@@ -59,91 +61,6 @@ pub const ast = struct {
             .tokens = tokens,
             .statements = try statements.toOwnedSlice(),
         };
-    }
-};
-
-pub const data = struct {
-    pub const TupleElement = union(enum) {
-        variable: Literal,
-        constant: Literal,
-    };
-
-    pub const Statement = union(enum) {
-        fact: struct {
-            predicate: Literal,
-            tuple: ?[]const Literal = null,
-        },
-        rule: struct {
-            predicate: Literal,
-            tuple: ?[]const TupleElement = null,
-            atoms: ?[]const ast.Atom = null,
-        },
-    };
-
-    pub fn parse(rule: ast.Rule, arena: *ArenaAllocator) !Statement {
-        const rule_predicate = rule.head.predicate;
-        const rule_implies = if (rule.body) |body| body.len > 0 else false;
-        const rule_states = if (rule.head.terms) |terms| terms.len > 0 else false;
-        if (!rule_implies) {
-            if (!rule_states) {
-                return Statement{ .fact = .{ .predicate = rule_predicate } };
-            }
-            var tuple = ArrayList(Literal).init(arena.allocator());
-            errdefer tuple.deinit();
-            for (rule.head.terms.?) |term| switch (term) {
-                .literal => |it| try tuple.append(it),
-                else => return error.ParseError,
-            };
-            return Statement{
-                .fact = .{
-                    .predicate = rule_predicate,
-                    .tuple = try tuple.toOwnedSlice(),
-                },
-            };
-        } else {
-            if (!rule_states) {
-                return Statement{ .rule = .{ .predicate = rule_predicate, .atoms = rule.body } };
-            }
-            const head = rule.head.terms.?;
-            var tuple = ArrayList(TupleElement).init(arena.allocator());
-            errdefer tuple.deinit();
-            var unbound = try DynamicBitSet.initEmpty(arena.allocator(), head.len);
-            defer unbound.deinit();
-            for (head, 0..) |term, idx| switch (term) {
-                .wildcard => return error.ParseError,
-                .literal => |it| {
-                    try tuple.append(TupleElement{ .constant = it });
-                },
-                .variable => |it| {
-                    try tuple.append(TupleElement{ .variable = it });
-                    unbound.set(idx);
-                },
-            };
-            atom: for (rule.body.?) |atom| {
-                _ = atom.terms orelse continue :atom;
-                for (atom.terms.?) |term| switch (term) {
-                    .variable => |this| {
-                        for (tuple.items, 0..) |t, idx| switch (t) {
-                            .variable => |that| {
-                                if (std.mem.eql(u8, this, that)) {
-                                    unbound.unset(idx);
-                                }
-                            },
-                            else => {},
-                        };
-                    },
-                    else => {},
-                };
-            }
-            if (unbound.count() > 0) return error.ParseError;
-            return Statement{
-                .rule = .{
-                    .predicate = rule_predicate,
-                    .tuple = try tuple.toOwnedSlice(),
-                    .atoms = rule.body,
-                },
-            };
-        }
     }
 };
 

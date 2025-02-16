@@ -3,7 +3,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
-const DomainValue = union(enum) {
+pub const DomainValue = union(enum) {
     seq: []const u8,
     fn clone(self: DomainValue, allocator: Allocator) Allocator.Error!DomainValue {
         switch (self) {
@@ -17,7 +17,7 @@ const DomainValue = union(enum) {
 };
 const DomainValueHashEql = struct {
     pub fn eql(_: @This(), this: DomainValue, that: DomainValue) bool {
-        return std.meta.eql(this, that);
+        return std.mem.eql(u8, this.seq, that.seq);
     }
     pub fn hash(_: @This(), this: DomainValue) u64 {
         switch (this) {
@@ -30,29 +30,26 @@ const DomainValueHashEql = struct {
 /// instead of using multiple copies of the data and wasting CPU cycles on equality checks
 /// store every encountered value in a unified domain index and assign a word id to it.
 /// Highly unlikely that a dataset for any program exceeds word size (?).
-const Domain = struct {
+pub const Domain = struct {
     const load_factor = std.hash_map.default_max_load_percentage;
-    /// Next unique index available for a domain value.
-    sequence: u64 = 0,
+    array: std.ArrayListUnmanaged(DomainValue) = .{},
     index: std.HashMapUnmanaged(DomainValue, u64, DomainValueHashEql, load_factor) = .{},
-    values: std.AutoHashMapUnmanaged(u64, DomainValue) = .{},
     /// Own, hash, and assign an unique id to this domain value.
-    fn register(self: *Domain, allocator: Allocator, value: DomainValue) Allocator.Error!u64 {
+    pub fn register(self: *Domain, allocator: Allocator, value: DomainValue) Allocator.Error!u64 {
         if (self.index.get(value)) |id| {
             return id;
         } else {
+            const id = self.array.items.len;
             try self.index.ensureUnusedCapacity(allocator, 1);
-            try self.values.ensureUnusedCapacity(allocator, 1);
-            const id = self.sequence;
+            try self.array.ensureUnusedCapacity(allocator, 1);
             const copy = try value.clone(allocator);
+            self.array.appendAssumeCapacity(copy);
             self.index.putAssumeCapacity(copy, id);
-            self.values.putAssumeCapacity(id, copy);
-            self.sequence += 1;
             return id;
         }
     }
     /// Relational tuples in this encoding become a simple []u64 slice.
-    fn encode(
+    pub fn encodeTuple(
         self: *Domain,
         allocator: Allocator,
         from: []const DomainValue,
@@ -63,23 +60,34 @@ const Domain = struct {
             into[j] = try self.register(allocator, from[j]);
         }
     }
+    pub fn encodeQuery(
+        self: *Domain,
+        allocator: Allocator,
+        from: []const ?DomainValue,
+        into: []?u64,
+    ) Allocator.Error!void {
+        std.debug.assert(from.len == into.len);
+        for (0..from.len) |j| {
+            into[j] = if (from[j]) |value| try self.register(allocator, value) else null;
+        }
+    }
     /// Returns a view into this Domain, caller does not own the data.
-    fn decode(
+    pub fn decodeTuple(
         self: *Domain,
         from: []const u64,
-        into: []?*DomainValue,
+        into: []DomainValue,
     ) void {
         std.debug.assert(from.len == into.len);
         for (0..from.len) |j| {
-            into[j] = self.values.getPtr(from[j]);
+            into[j] = self.array.items[from[j]];
         }
     }
 };
 
 /// Identifies relation by name and relation arity.
 /// Each relation in database corresponds to a specific relation backend.
-const Relation = struct {
-    arity: u32,
+pub const Relation = struct {
+    arity: usize,
     name: []const u8,
     fn clone(self: Relation, allocator: Allocator) Allocator.Error!Relation {
         const name_copy = try allocator.alloc(u8, self.name.len);
@@ -89,7 +97,7 @@ const Relation = struct {
 };
 const RelationHashEql = struct {
     pub fn eql(_: @This(), this: Relation, that: Relation) bool {
-        return std.meta.eql(this, that);
+        return this.arity == that.arity and std.mem.eql(u8, this.name, that.name);
     }
     pub fn hash(_: @This(), this: Relation) u64 {
         return std.hash.Wyhash.hash(this.arity, this.name);
@@ -105,21 +113,21 @@ pub const TupleIterator = struct {
     vtable: *const VTable,
     const VTable = struct {
         next: *const fn (ctx: *anyopaque, into: []u64) bool,
-        destroy: *const fn (ctx: *anyopaque, allocator: Allocator) void,
+        destroy: *const fn (ctx: *anyopaque) void,
     };
     /// Returns true if search produces a new tuple,
     /// which in turn gets written to an `into` slice.
     pub fn next(self: *TupleIterator, into: []u64) bool {
         return self.vtable.next(self.ptr, into);
     }
-    pub fn destroy(self: *TupleIterator, allocator: Allocator) void {
-        self.vtable.destroy(self.ptr, allocator);
+    pub fn destroy(self: *TupleIterator) void {
+        self.vtable.destroy(self.ptr);
     }
 };
 
 /// Trivial relation storage backed by an ArrayList.
 const ArrayListBackend = struct {
-    arity: u32,
+    arity: usize,
     array: std.ArrayListUnmanaged(u64) = .{},
 
     fn insert(
@@ -136,13 +144,14 @@ const ArrayListBackend = struct {
         allocator: Allocator,
         tuple: []const ?u64,
     ) Allocator.Error!TupleIterator {
-        return IterImpl.create(allocator, .{ .owner = self, .query = tuple });
+        return IterImpl.create(allocator, .{ .owner = self, .query = tuple, .allocator = allocator });
     }
 
     const IterImpl = struct {
         index: u32 = 0,
         owner: *const ArrayListBackend,
         query: []const ?u64,
+        allocator: Allocator,
         const VTable = &TupleIterator.VTable{
             .next = next,
             .destroy = destroy,
@@ -170,28 +179,63 @@ const ArrayListBackend = struct {
             }
             return false;
         }
-        fn destroy(ptr: *anyopaque, allocator: Allocator) void {
+        fn destroy(ptr: *anyopaque) void {
             const self: *IterImpl = @ptrCast(@alignCast(ptr));
-            allocator.destroy(self);
+            self.allocator.destroy(self);
         }
     };
 };
 
-test "ArrayListStorage" {
-    var arena = ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var storage = ArrayListBackend{ .arity = 2 };
-    try storage.insert(arena.allocator(), &[_]u64{ 1, 0 });
-    try storage.insert(arena.allocator(), &[_]u64{ 1, 1 });
-    try storage.insert(arena.allocator(), &[_]u64{ 1, 2 });
-    try storage.insert(arena.allocator(), &[_]u64{ 2, 0 });
-    try storage.insert(arena.allocator(), &[_]u64{ 2, 1 });
-
-    var it = try storage.query(arena.allocator(), &[_]?u64{ null, 1 });
-    defer it.destroy(arena.allocator());
-
-    var tup: [2]u64 = undefined;
-    while (it.next(&tup)) {
-        std.debug.print("{any}\n", .{tup});
+const RelationBackend = union(enum) {
+    array_list: ArrayListBackend,
+    fn insert(
+        self: *RelationBackend,
+        database_allocator: Allocator,
+        tuple: []const u64,
+    ) Allocator.Error!void {
+        return switch (self.*) {
+            .array_list => |*backend| backend.insert(database_allocator, tuple),
+        };
     }
-}
+    fn query(
+        self: *RelationBackend,
+        allocator: Allocator,
+        tuple: []const ?u64,
+    ) Allocator.Error!TupleIterator {
+        return switch (self.*) {
+            .array_list => |*backend| backend.query(allocator, tuple),
+        };
+    }
+};
+
+pub const Db = struct {
+    const load_factor = std.hash_map.default_max_load_percentage;
+    relations: std.HashMapUnmanaged(Relation, RelationBackend, RelationHashEql, load_factor) = .{},
+    pub fn registerArrayBackend(self: *Db, allocator: Allocator, relation: Relation) Allocator.Error!void {
+        if (!self.relations.contains(relation)) {
+            return self.relations.putNoClobber(
+                allocator,
+                relation,
+                RelationBackend{ .array_list = .{ .arity = relation.arity } },
+            );
+        }
+    }
+    pub fn query(
+        self: *Db,
+        allocator: Allocator,
+        relation: Relation,
+        tuple: []const ?u64,
+    ) Allocator.Error!TupleIterator {
+        const ptr = self.relations.getPtr(relation).?;
+        return ptr.query(allocator, tuple);
+    }
+    pub fn insert(
+        self: *Db,
+        allocator: Allocator,
+        relation: Relation,
+        tuple: []const u64,
+    ) Allocator.Error!void {
+        const ptr = self.relations.getPtr(relation).?;
+        return ptr.insert(allocator, tuple);
+    }
+};

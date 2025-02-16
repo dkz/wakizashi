@@ -1,5 +1,6 @@
 const std = @import("std");
 const lang = @import("lang.zig");
+const database = @import("database.zig");
 
 const ArenaAllocator = std.heap.ArenaAllocator;
 
@@ -31,8 +32,11 @@ pub fn main() !void {
         };
         const file = try lang.ast.parse(a, source, &source_arena);
         for (file.statements) |statement| {
-            const data = try lang.data.parse(statement, &local);
-            try pretty_print(data, stdout);
+            const relation = database.Relation{
+                .name = statement.head.predicate,
+                .arity = statement.head.terms.len,
+            };
+            try pretty_print(relation, stdout);
         }
     }
 

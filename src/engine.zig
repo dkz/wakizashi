@@ -163,11 +163,11 @@ const DomainRule = struct {
     }
 };
 
-const Evaluator = struct {
+pub const Evaluator = struct {
     db: database.Db = .{},
     domain: database.Domain = .{},
     program: std.ArrayListUnmanaged(DomainRule) = .{},
-    fn read(self: *Evaluator, file: *const lang.ast.File, allocator: Allocator) Allocator.Error!void {
+    pub fn read(self: *Evaluator, file: *const lang.ast.File, allocator: Allocator) Allocator.Error!void {
         try self.program.ensureUnusedCapacity(allocator, file.statements.len);
         for (file.statements) |*statement| {
             const rule = try DomainRule.init(statement, &self.domain, allocator);
@@ -219,47 +219,61 @@ const Evaluator = struct {
             allocator.destroy(bindings);
         }
     }
-    fn iterate(
+    pub fn iterate(
         self: *Evaluator,
         arena: *ArenaAllocator,
-    ) !void {
+    ) !bool {
+        var discovered_new: bool = false;
         const allocator = arena.allocator();
         for (self.program.items) |*rule| {
             var inferred = std.ArrayList([]const u64).init(allocator);
             defer inferred.deinit();
             try self.infer(rule, &inferred, arena);
+            const query_tuple = try allocator.alloc(?u64, rule.head.relation.arity);
+            defer allocator.free(query_tuple);
+            const buffer = try allocator.alloc(u64, rule.head.relation.arity);
+            defer allocator.free(buffer);
             for (inferred.items) |i| {
-                try self.db.insert(allocator, rule.head.relation, i);
+                for (i, 0..) |x, j| query_tuple[j] = x;
+                var it = try self.db.query(allocator, rule.head.relation, query_tuple);
+                defer it.destroy();
+                if (!it.next(buffer)) {
+                    try self.db.insert(allocator, rule.head.relation, i);
+                    discovered_new = true;
+                }
+            }
+        }
+        return discovered_new;
+    }
+    pub fn printDb(self: *Evaluator, allocator: Allocator, writer: std.io.AnyWriter) !void {
+        var arena = ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const local = arena.allocator();
+        var it = self.db.relations.iterator();
+        while (it.next()) |entry| {
+            const arity = entry.key_ptr.arity;
+
+            const query = try local.alloc(?u64, arity);
+            defer local.free(query);
+            const tuple = try local.alloc(u64, arity);
+            defer local.free(tuple);
+            const decoded = try local.alloc(database.DomainValue, arity);
+            defer local.free(decoded);
+
+            for (query) |*q| q.* = null;
+            var iterator = try self.db.query(local, entry.key_ptr.*, query);
+            defer iterator.destroy();
+            while (iterator.next(tuple)) {
+                self.domain.decodeTuple(tuple, decoded);
+                try writer.print("{s}(", .{entry.key_ptr.name});
+                for (decoded, 0..) |elem, j| {
+                    try writer.print("{s}", .{elem.seq});
+                    if (j + 1 < decoded.len) {
+                        try writer.print(",", .{});
+                    }
+                }
+                try writer.print(")\n", .{});
             }
         }
     }
 };
-
-test "Basic inference" {
-    var arena = ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var evaluator = Evaluator{};
-    const program =
-        \\edge(x, y).
-        \\edge(y, z).
-        \\path(A, B) :- edge(A, C), edge(C, B).
-    ;
-    const ast = try lang.ast.parse(".", program, &arena);
-    try evaluator.read(&ast, arena.allocator());
-    try evaluator.iterate(&arena);
-    {
-        var t: [2]u64 = undefined;
-        var d: [2]database.DomainValue = undefined;
-        var it = try evaluator.db.query(
-            arena.allocator(),
-            database.Relation{ .arity = 2, .name = "edge" },
-            &[2]?u64{ null, null },
-        );
-        defer it.destroy();
-        while (it.next(&t)) {
-            evaluator.domain.decodeTuple(&t, &d);
-            std.debug.print("edge({s}, {s})\n", .{ d[0].seq, d[1].seq });
-        }
-    }
-}

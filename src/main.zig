@@ -1,7 +1,7 @@
 const std = @import("std");
 const lang = @import("lang.zig");
 const database = @import("database.zig");
-
+const engine = @import("engine.zig");
 const ArenaAllocator = std.heap.ArenaAllocator;
 
 pub fn main() !void {
@@ -12,9 +12,14 @@ pub fn main() !void {
     var source_arena = ArenaAllocator.init(gpa.allocator());
     defer source_arena.deinit();
 
+    var database_arena = ArenaAllocator.init(gpa.allocator());
+    defer database_arena.deinit();
+
     const stdout_handle = std.io.getStdOut();
     var stdout_buffered = std.io.bufferedWriter(stdout_handle.writer());
     const stdout = stdout_buffered.writer();
+
+    var evaluator = engine.Evaluator{};
 
     const cwd = std.fs.cwd();
     var args = try std.process.argsWithAllocator(gpa.allocator());
@@ -28,16 +33,17 @@ pub fn main() !void {
         const source = source: {
             var reader = std.io.bufferedReader(source_file.reader());
             const rdr = reader.reader();
-            break :source try rdr.readAllAlloc(source_arena.allocator(), 1024);
+            break :source try rdr.readAllAlloc(source_arena.allocator(), 1024 * 8);
         };
         const file = try lang.ast.parse(a, source, &source_arena);
-        for (file.statements) |statement| {
-            const relation = database.Relation{
-                .name = statement.head.predicate,
-                .arity = statement.head.terms.len,
-            };
-            try pretty_print(relation, stdout);
-        }
+        try evaluator.read(&file, database_arena.allocator());
+    }
+
+    while (try evaluator.iterate(&database_arena)) {}
+    {
+        var local = ArenaAllocator.init(gpa.allocator());
+        defer local.deinit();
+        try evaluator.printDb(local.allocator(), stdout.any());
     }
 
     try stdout_buffered.flush();

@@ -19,7 +19,7 @@ pub fn main() !void {
     var stdout_buffered = std.io.bufferedWriter(stdout_handle.writer());
     const stdout = stdout_buffered.writer();
 
-    var evaluator = engine.Evaluator{};
+    var evaluator = engine.Evaluator.create(database_arena.allocator());
 
     const cwd = std.fs.cwd();
     var args = try std.process.argsWithAllocator(gpa.allocator());

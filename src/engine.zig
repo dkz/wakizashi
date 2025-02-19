@@ -164,14 +164,22 @@ const DomainRule = struct {
 };
 
 pub const Evaluator = struct {
-    db: database.Db = .{},
+    db: database.Db,
     domain: database.Domain = .{},
     program: std.ArrayListUnmanaged(DomainRule) = .{},
+    allocator: Allocator,
+    pub fn create(allocator: Allocator) Evaluator {
+        return .{
+            .db = database.Db.create(allocator),
+            .allocator = allocator,
+        };
+    }
+
     pub fn read(self: *Evaluator, file: *const lang.ast.File, allocator: Allocator) Allocator.Error!void {
         try self.program.ensureUnusedCapacity(allocator, file.statements.len);
         for (file.statements) |*statement| {
             const rule = try DomainRule.init(statement, &self.domain, allocator);
-            try self.db.registerArrayBackend(allocator, rule.head.relation);
+            try self.db.setListRelationBackend(rule.head.relation);
             self.program.appendAssumeCapacity(rule);
         }
     }
@@ -182,7 +190,7 @@ pub const Evaluator = struct {
         const result = try allocator.alloc(u64, from.relation.arity);
         defer allocator.free(result);
         from.initQuery(with, query);
-        var it = try self.db.query(allocator, from.relation, query);
+        var it = try self.db.query(from.relation, query, allocator);
         defer it.destroy();
         while (it.next(result)) {
             try into.append(try from.unify(result, with, allocator));
@@ -229,18 +237,9 @@ pub const Evaluator = struct {
             var inferred = std.ArrayList([]const u64).init(allocator);
             defer inferred.deinit();
             try self.infer(rule, &inferred, arena);
-            const query_tuple = try allocator.alloc(?u64, rule.head.relation.arity);
-            defer allocator.free(query_tuple);
-            const buffer = try allocator.alloc(u64, rule.head.relation.arity);
-            defer allocator.free(buffer);
-            for (inferred.items) |i| {
-                for (i, 0..) |x, j| query_tuple[j] = x;
-                var it = try self.db.query(allocator, rule.head.relation, query_tuple);
-                defer it.destroy();
-                if (!it.next(buffer)) {
-                    try self.db.insert(allocator, rule.head.relation, i);
-                    discovered_new = true;
-                }
+            for (inferred.items) |item| {
+                discovered_new = discovered_new or
+                    try self.db.insertSingleUnique(rule.head.relation, item, allocator);
             }
         }
         return discovered_new;
@@ -261,7 +260,7 @@ pub const Evaluator = struct {
             defer local.free(decoded);
 
             for (query) |*q| q.* = null;
-            var iterator = try self.db.query(local, entry.key_ptr.*, query);
+            var iterator = try self.db.query(entry.key_ptr.*, query, local);
             defer iterator.destroy();
             while (iterator.next(tuple)) {
                 self.domain.decodeTuple(tuple, decoded);

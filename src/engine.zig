@@ -238,8 +238,9 @@ pub const Evaluator = struct {
             defer inferred.deinit();
             try self.infer(rule, &inferred, arena);
             for (inferred.items) |item| {
+                var tuple = database.SliceTupleIterator.ofSingleton(item);
                 discovered_new = discovered_new or
-                    try self.db.insertSingleUnique(rule.head.relation, item, allocator);
+                    try self.db.insert(rule.head.relation, tuple.iterator(), allocator) > 0;
             }
         }
         return discovered_new;

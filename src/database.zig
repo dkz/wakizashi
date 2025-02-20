@@ -3,8 +3,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
-pub const InsertError = error{DatabaseInsertError};
-pub const AccessError = error{DatabaseAccessError};
+pub const InsertError = error{DatabaseInsertError} || Allocator.Error;
+pub const AccessError = error{DatabaseAccessError} || Allocator.Error;
 
 pub const DomainValue = union(enum) {
     seq: []const u8,
@@ -132,15 +132,19 @@ pub const TupleIterator = struct {
 /// Trivial tuple iterator backed by a slice.
 /// Can be used to produce iterators from ArrayLists as well as singleton iterators.
 pub const SliceTupleIterator = struct {
-    allocator: Allocator,
+    /// Non-null for iterators created on heap to pass up the stack,
+    /// like for iterators created inside relation backends.
+    allocator: ?Allocator = null,
     slice: []const u64,
     index: usize = 0,
     arity: usize,
 
-    pub fn create(opts: SliceTupleIterator) Allocator.Error!TupleIterator {
-        const context = try opts.allocator.create(SliceTupleIterator);
-        context.* = opts;
-        return TupleIterator{ .vtable = VTable, .ptr = context };
+    pub fn ofSingleton(tuple: []const u64) SliceTupleIterator {
+        return .{ .slice = tuple, .arity = tuple.len };
+    }
+
+    pub fn iterator(self: *SliceTupleIterator) TupleIterator {
+        return .{ .vtable = VTable, .ptr = self };
     }
 
     const VTable = &TupleIterator.VTable{
@@ -150,7 +154,7 @@ pub const SliceTupleIterator = struct {
 
     fn destroy(ptr: *anyopaque) void {
         const self: *SliceTupleIterator = @ptrCast(@alignCast(ptr));
-        self.allocator.destroy(self);
+        if (self.allocator) |allocator| allocator.destroy(self);
     }
 
     fn next(ptr: *anyopaque, into: []u64) bool {
@@ -171,14 +175,13 @@ pub const SliceTupleIterator = struct {
 /// Returns tuples from backend filtered by the pattern.
 /// Note it owns the backend iterator, call to destroy destroys the backend.
 pub const QueryTupleIterator = struct {
-    allocator: Allocator,
+    /// Non-null when iterator was created on heap.
+    allocator: ?Allocator,
     backend: TupleIterator,
     pattern: []const ?u64,
 
-    pub fn create(opts: QueryTupleIterator) Allocator.Error!TupleIterator {
-        const context = try opts.allocator.create(QueryTupleIterator);
-        context.* = opts;
-        return TupleIterator{ .vtable = VTable, .ptr = context };
+    pub fn iterator(self: *QueryTupleIterator) TupleIterator {
+        return .{ .vtable = VTable, .ptr = self };
     }
 
     const VTable = &TupleIterator.VTable{
@@ -189,7 +192,7 @@ pub const QueryTupleIterator = struct {
     fn destroy(ptr: *anyopaque) void {
         const self: *QueryTupleIterator = @ptrCast(@alignCast(ptr));
         self.backend.destroy();
-        self.allocator.destroy(self);
+        if (self.allocator) |allocator| allocator.destroy(self);
     }
 
     fn next(ptr: *anyopaque, into: []u64) bool {
@@ -212,11 +215,12 @@ pub const RelationBackend = struct {
         /// Bulk insertion method, populates this backend by draining the iterator.
         /// Caller provides an allocator for intermediate operations like allocating a buffer.
         /// AllocatorError will be reported as an InsertError.
+        /// Return the number of unique tuples inserted.
         insert: *const fn (
             ctx: *anyopaque,
             iterator: TupleIterator,
             allocator: Allocator,
-        ) InsertError!void,
+        ) InsertError!usize,
 
         /// Returns an iterators for all tuples matching the pattern.
         /// Caller provides an allocator for intermediate operations and allocating the iterator.
@@ -230,7 +234,7 @@ pub const RelationBackend = struct {
         destroy: *const fn (ctx: *anyopaque) void,
     };
 
-    pub fn insert(self: *RelationBackend, iterator: TupleIterator, allocator: Allocator) InsertError!void {
+    pub fn insert(self: *RelationBackend, iterator: TupleIterator, allocator: Allocator) InsertError!usize {
         return self.vtable.insert(self.ptr, iterator, allocator);
     }
 
@@ -240,34 +244,6 @@ pub const RelationBackend = struct {
 
     pub fn destroy(self: *RelationBackend) void {
         self.vtable.destroy(self.ptr);
-    }
-
-    /// Inserts a unique tuple into this backend.
-    /// Returns true if backend accepts a unique tuple, or false if it is already listed.
-    pub fn insertSingleUnique(self: *RelationBackend, tuple: []const u64, allocator: Allocator) (AccessError || InsertError)!bool {
-
-        // Throwaway buffer for checking whether target tuple exists.
-        const throwaway = allocator.alloc(u64, tuple.len) catch return error.DatabaseInsertError;
-        defer allocator.free(throwaway);
-        // Copy of the target tuple as a query pattern.
-        const pattern = allocator.alloc(?u64, tuple.len) catch return error.DatabaseInsertError;
-        defer allocator.free(pattern);
-        for (tuple, 0..) |x, j| pattern[j] = x;
-
-        var it = try self.query(pattern, allocator);
-        defer it.destroy();
-        if (!it.next(throwaway)) {
-            var insertion = SliceTupleIterator.create(.{
-                .allocator = allocator,
-                .arity = tuple.len,
-                .slice = tuple,
-            }) catch return error.DatabaseInsertError;
-            defer insertion.destroy();
-            try self.insert(insertion, allocator);
-            return true;
-        } else {
-            return false;
-        }
     }
 };
 
@@ -293,28 +269,39 @@ pub const ListRelationBackend = struct {
         self.array.deinit(self.allocator);
     }
 
-    fn insert(ptr: *anyopaque, iterator: TupleIterator, allocator: Allocator) InsertError!void {
+    fn insert(ptr: *anyopaque, iterator: TupleIterator, allocator: Allocator) InsertError!usize {
         const self: *ListRelationBackend = @ptrCast(@alignCast(ptr));
-        const buff = allocator.alloc(u64, self.arity) catch return error.DatabaseInsertError;
-        while (iterator.next(buff)) {
+        var count: usize = 0;
+        const buff = try allocator.alloc(u64, self.arity);
+        const a = self.arity;
+        loop: while (iterator.next(buff)) {
+            var j: usize = 0;
+            while (j * self.arity < self.array.items.len) : (j += 1) {
+                if (std.mem.eql(u64, buff, self.array.items[j * a .. a + j * a])) continue :loop;
+            }
+            count += 1;
             self.array.appendSlice(self.allocator, buff) catch
                 return error.DatabaseInsertError;
         }
+        return count;
     }
 
     fn query(ptr: *anyopaque, pattern: []const ?u64, allocator: Allocator) AccessError!TupleIterator {
         const self: *ListRelationBackend = @ptrCast(@alignCast(ptr));
-        const iterator = SliceTupleIterator.create(.{
+        const items = try allocator.create(SliceTupleIterator);
+        errdefer allocator.destroy(items);
+        items.* = .{
             .allocator = allocator,
             .arity = self.arity,
             .slice = self.array.items,
-        }) catch return error.DatabaseAccessError;
-        const filter = QueryTupleIterator.create(.{
+        };
+        const filter = try allocator.create(QueryTupleIterator);
+        filter.* = .{
             .allocator = allocator,
-            .backend = iterator,
+            .backend = items.iterator(),
             .pattern = pattern,
-        }) catch return error.DatabaseAccessError;
-        return filter;
+        };
+        return filter.iterator();
     }
 };
 
@@ -349,17 +336,8 @@ pub const Db = struct {
         relation: Relation,
         iterator: TupleIterator,
         allocator: Allocator,
-    ) !void {
+    ) !usize {
         const ptr = self.relations.getPtr(relation).?;
         return ptr.insert(iterator, allocator);
-    }
-    pub fn insertSingleUnique(
-        self: *Db,
-        relation: Relation,
-        tuple: []const u64,
-        allocator: Allocator,
-    ) !bool {
-        const ptr = self.relations.getPtr(relation).?;
-        return ptr.insertSingleUnique(tuple, allocator);
     }
 };

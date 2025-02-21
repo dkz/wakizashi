@@ -1,4 +1,5 @@
 const std = @import("std");
+const datastructures = @import("datastructures.zig");
 
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -111,7 +112,7 @@ pub const Relation = struct {
 pub const TupleIterator = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
-    const VTable = struct {
+    pub const VTable = struct {
         next: *const fn (ctx: *anyopaque, into: []u64) bool,
         destroy: *const fn (ctx: *anyopaque) void,
     };
@@ -252,62 +253,16 @@ pub const RelationBackend = struct {
     }
 };
 
-pub const ListRelationBackend = struct {
-    allocator: Allocator,
-    array: std.ArrayListUnmanaged(u64) = .{},
-    arity: usize,
-
-    fn storage(self: *ListRelationBackend) RelationStorage {
-        return .{ .ptr = self, .insertFn = insert };
-    }
-
-    fn insert(ptr: *anyopaque, iterator: TupleIterator, allocator: Allocator) InsertError!usize {
-        const self: *ListRelationBackend = @ptrCast(@alignCast(ptr));
-        var count: usize = 0;
-        const buff = try allocator.alloc(u64, self.arity);
-        const a = self.arity;
-        loop: while (iterator.next(buff)) {
-            var j: usize = 0;
-            while (j * self.arity < self.array.items.len) : (j += 1) {
-                if (std.mem.eql(u64, buff, self.array.items[j * a .. a + j * a])) continue :loop;
-            }
-            count += 1;
-            self.array.appendSlice(self.allocator, buff) catch
-                return error.RelationInsertError;
-        }
-        return count;
-    }
-
-    fn backend(self: *ListRelationBackend) RelationBackend {
-        return .{ .ptr = self, .queryFn = query, .tuplesFn = tuples };
-    }
-
-    fn query(ptr: *anyopaque, pattern: []const ?u64, allocator: Allocator) AccessError!TupleIterator {
-        const items = try ListRelationBackend.tuples(ptr, allocator);
-        errdefer items.destroy();
-        const filter = try allocator.create(QueryTupleIterator);
-        filter.* = .{ .allocator = allocator, .backend = items, .pattern = pattern };
-        return filter.iterator();
-    }
-
-    fn tuples(ptr: *anyopaque, allocator: Allocator) AccessError!TupleIterator {
-        const self: *ListRelationBackend = @ptrCast(@alignCast(ptr));
-        const items = try allocator.create(SliceTupleIterator);
-        items.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.array.items };
-        return items.iterator();
-    }
-};
-
 pub const Db = struct {
     const load_factor = std.hash_map.default_max_load_percentage;
     allocator: Allocator,
-    relations: std.HashMapUnmanaged(Relation, *ListRelationBackend, Relation.Equality, load_factor) = .{},
+    relations: std.HashMapUnmanaged(Relation, *datastructures.KDTree, Relation.Equality, load_factor) = .{},
     pub fn create(allocator: Allocator) Db {
         return .{ .allocator = allocator };
     }
     pub fn setListRelationBackend(self: *Db, relation: Relation) Allocator.Error!void {
         if (!self.relations.contains(relation)) {
-            const backend = try self.allocator.create(ListRelationBackend);
+            const backend = try self.allocator.create(datastructures.KDTree);
             errdefer self.allocator.destroy(backend);
             backend.* = .{
                 .allocator = self.allocator,

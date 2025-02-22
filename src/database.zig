@@ -1,5 +1,4 @@
 const std = @import("std");
-const datastructures = @import("datastructures.zig");
 
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -253,16 +252,281 @@ pub const RelationBackend = struct {
     }
 };
 
+pub const KDTree = struct {
+    /// Arity of stored tuples.
+    arity: usize,
+    allocator: Allocator,
+    /// Stores tuple data into a single continuous array.
+    tuples: std.ArrayListUnmanaged(u64) = .{},
+    /// Stores all tree nodes into a single continuous array for better locality.
+    nodes: std.ArrayListUnmanaged(Node) = .{},
+
+    /// Refers to index in the tuples data array,
+    /// and to left and right nodes in the nodes array.
+    /// Packed structs can't contain optional unions:
+    /// instead we know that a tree is a tree and
+    /// child nodes can't link to a root,
+    /// so left and right cannot have a meaningfull 0 value.
+    const Node = packed struct {
+        hash: u64,
+        left: usize,
+        right: usize,
+    };
+
+    pub fn deinit(self: *KDTree) void {
+        self.tuples.deinit(self.allocator);
+        self.nodes.deinit(self.allocator);
+    }
+
+    // Interfaces:
+
+    pub fn storage(self: *KDTree) RelationStorage {
+        return .{ .ptr = self, .insertFn = storageInsert };
+    }
+
+    fn storageInsert(ptr: *anyopaque, iterator: TupleIterator, allocator: Allocator) InsertError!usize {
+        const self: *KDTree = @ptrCast(@alignCast(ptr));
+        var count: usize = 0;
+        const buff = try allocator.alloc(u64, self.arity);
+        // TODO: presort to make k-d tree balanced at least after one insert?
+        while (iterator.next(buff)) {
+            if (try self.insertNode(buff)) count += 1;
+        }
+        return count;
+    }
+
+    pub fn backend(self: *KDTree) RelationBackend {
+        return .{ .ptr = self, .queryFn = backendQuery, .tuplesFn = backendTuples };
+    }
+
+    fn backendQuery(ptr: *anyopaque, pattern: []const ?u64, allocator: Allocator) AccessError!TupleIterator {
+        const self: *KDTree = @ptrCast(@alignCast(ptr));
+        const it = try allocator.create(QueryIterator);
+        errdefer allocator.destroy(it);
+        it.* = .{
+            .allocator = allocator,
+            .pattern = pattern,
+            .tree = self,
+            .queue = QueryIterator.Queue.init(allocator),
+        };
+        errdefer it.queue.deinit();
+        if (0 < self.nodes.items.len) {
+            try it.queue.writeItem(.{ .depth = 0, .node_idx = 0 });
+        }
+        return it.iterator();
+    }
+
+    fn backendTuples(ptr: *anyopaque, allocator: Allocator) AccessError!TupleIterator {
+        const self: *KDTree = @ptrCast(@alignCast(ptr));
+        const it = try allocator.create(SliceTupleIterator);
+        it.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.tuples.items };
+        return it.iterator();
+    }
+
+    const QueryIterator = struct {
+        const State = struct { depth: usize, node_idx: usize };
+        const Queue = std.fifo.LinearFifo(State, .Dynamic);
+        allocator: Allocator,
+        pattern: []const ?u64,
+        tree: *KDTree,
+
+        /// BFS queue with node idx:
+        queue: Queue,
+
+        pub fn iterator(self: *@This()) TupleIterator {
+            return .{ .vtable = VTable, .ptr = self };
+        }
+
+        const VTable = &TupleIterator.VTable{
+            .destroy = destroy,
+            .next = next,
+        };
+
+        fn destroy(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.queue.deinit();
+            self.allocator.destroy(self);
+        }
+
+        fn next(ptr: *anyopaque, into: []u64) bool {
+            errdefer unreachable; // TODO make .next() also throw an error I guess.
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.pattern.len == into.len);
+            while (self.queue.readItem()) |state| {
+                const node = &self.tree.nodes.items[state.node_idx];
+                if (self.pattern[state.depth % self.tree.arity]) |pat| {
+                    const comp = self.tree.elemAt(state.node_idx, state.depth % self.tree.arity);
+                    if (pat < comp) {
+                        // Inspect only left subtree.
+                        if (0 < node.left) {
+                            try self.queue.writeItem(.{ .depth = 1 + state.depth, .node_idx = node.left });
+                        }
+                    } else {
+                        // Inspect only right subtree.
+                        if (0 < node.right) {
+                            try self.queue.writeItem(.{ .depth = 1 + state.depth, .node_idx = node.right });
+                        }
+                    }
+                } else {
+                    // It's a Wildcard, add both subtrees to BFS:
+                    if (0 < node.left) {
+                        try self.queue.writeItem(.{ .depth = 1 + state.depth, .node_idx = node.left });
+                    }
+                    if (0 < node.right) {
+                        try self.queue.writeItem(.{ .depth = 1 + state.depth, .node_idx = node.right });
+                    }
+                }
+                const tuple = self.tree.tupleAt(state.node_idx);
+                if (self.matches(tuple)) {
+                    @memcpy(into, tuple);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        fn matches(self: *QueryIterator, tuple: []const u64) bool {
+            for (self.pattern, 0..) |pat, j| {
+                if (pat) |q| if (q != tuple[j]) return false;
+            }
+            return true;
+        }
+    };
+
+    pub fn backup(self: *KDTree, into: std.io.AnyWriter) !void {
+        // TODO: this function just yolo-s the memory layout into file,
+        // using platform's endianness and usize. But it should be fine?
+        const builtin = @import("builtin");
+        const endian = builtin.cpu.arch.endian();
+        try into.writeInt(usize, self.arity, endian);
+        {
+            const binary_nodes = std.mem.sliceAsBytes(self.nodes.items);
+            try into.writeInt(usize, self.nodes.items.len, endian);
+            try into.writeAll(binary_nodes);
+        }
+        {
+            const binary_tuples = std.mem.sliceAsBytes(self.tuples.items);
+            try into.writeInt(usize, self.tuples.items.len, endian);
+            try into.writeAll(binary_tuples);
+        }
+    }
+
+    pub fn restore(from: std.io.AnyReader, allocator: Allocator) !KDTree {
+        const builtin = @import("builtin");
+        const endian = builtin.cpu.arch.endian();
+        const from_arity = try from.readInt(usize, endian);
+        const nodes_count = try from.readInt(usize, endian);
+        const from_nodes: []Node = try allocator.alloc(Node, nodes_count);
+        errdefer allocator.free(from_nodes);
+        _ = try from.readAll(std.mem.sliceAsBytes(from_nodes));
+
+        const tuples_count = try from.readInt(usize, endian);
+        const from_tuples = try allocator.alloc(u64, tuples_count);
+        errdefer allocator.free(from_tuples);
+        _ = try from.readAll(std.mem.sliceAsBytes(from_tuples));
+        return KDTree{
+            .allocator = allocator,
+            .arity = from_arity,
+            .tuples = std.ArrayListUnmanaged(u64){
+                .items = from_tuples,
+                .capacity = from_tuples.len,
+            },
+            .nodes = std.ArrayListUnmanaged(Node){
+                .items = from_nodes,
+                .capacity = from_nodes.len,
+            },
+        };
+    }
+
+    // Internals:
+
+    /// Returns tuple's element.
+    inline fn elemAt(self: *KDTree, index: usize, elem: usize) u64 {
+        return self.tuples.items[index * self.arity + elem];
+    }
+
+    inline fn tupleAt(self: *KDTree, index: usize) []const u64 {
+        return self.tuples.items[index * self.arity .. self.arity + index * self.arity];
+    }
+
+    fn insertNode(self: *KDTree, tuple: []const u64) InsertError!bool {
+        const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(tuple));
+        if (self.nodes.items.len == 0) {
+            // No root node special case.
+            try self.tuples.appendSlice(self.allocator, tuple);
+            const node = try self.nodes.addOne(self.allocator);
+            node.* = .{
+                .hash = hash,
+                .left = 0,
+                .right = 0,
+            };
+            return true;
+        }
+        if (self.lookupNodeSlot(tuple, hash)) |ptr| {
+            const node_idx = self.nodes.items.len;
+            // TODO: if any of those fails, leaves tree in unconsistent state
+            // however probably an application should just crash on Out of memory
+            // and call it a day.
+            try self.tuples.appendSlice(self.allocator, tuple);
+            const node = try self.nodes.addOne(self.allocator);
+            node.* = .{
+                .hash = hash,
+                .left = 0,
+                .right = 0,
+            };
+            ptr.* = node_idx;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /// Find a fitting free slot in a tree node.
+    /// It points to left or right field of an existing tree node.
+    /// Returns null if target tuple is a dublicate.
+    fn lookupNodeSlot(self: *KDTree, tuple: []const u64, hash: u64) ?*usize {
+        std.debug.assert(0 < self.nodes.items.len);
+        var depth: usize = 0;
+        var slot: ?*usize = null;
+        var at: usize = 0;
+        while (true) {
+            const node = &self.nodes.items[at];
+            const comp = self.elemAt(at, depth % self.arity);
+            const proj = tuple[depth % self.arity];
+            if (proj < comp) {
+                depth += 1;
+                slot = &node.left;
+            } else if (proj == comp) {
+                // First, check for a hash collision:
+                if (hash == node.hash) {
+                    // Second, tuple equality:
+                    if (std.mem.eql(u64, tuple, self.tupleAt(at))) {
+                        return null;
+                    }
+                }
+                // Pass it to the right sub-branch:
+                depth += 1;
+                slot = &node.right;
+            } else {
+                depth += 1;
+                slot = &node.right;
+            }
+            at = slot.?.*;
+            if (at == 0) return slot;
+        }
+    }
+};
+
 pub const Db = struct {
     const load_factor = std.hash_map.default_max_load_percentage;
     allocator: Allocator,
-    relations: std.HashMapUnmanaged(Relation, *datastructures.KDTree, Relation.Equality, load_factor) = .{},
+    relations: std.HashMapUnmanaged(Relation, *KDTree, Relation.Equality, load_factor) = .{},
     pub fn create(allocator: Allocator) Db {
         return .{ .allocator = allocator };
     }
     pub fn setListRelationBackend(self: *Db, relation: Relation) Allocator.Error!void {
         if (!self.relations.contains(relation)) {
-            const backend = try self.allocator.create(datastructures.KDTree);
+            const backend = try self.allocator.create(KDTree);
             errdefer self.allocator.destroy(backend);
             backend.* = .{
                 .allocator = self.allocator,

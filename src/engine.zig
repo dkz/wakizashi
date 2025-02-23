@@ -73,7 +73,7 @@ const DomainTuple = struct {
                     tuple[j] = DomainTerm{
                         // TODO Do something about rewriter using the same allocator for rewrites
                         // and pushing values to the underlying domain.
-                        .constant = try domain.register(allocator, database.DomainValue{ .seq = value }),
+                        .constant = try domain.register(allocator, database.DomainValue{ .binary = value }),
                     };
                 },
             }
@@ -238,7 +238,7 @@ pub const Evaluator = struct {
             defer inferred.deinit();
             try self.infer(rule, &inferred, arena);
             for (inferred.items) |item| {
-                var tuple = database.SliceTupleIterator.ofSingleton(item);
+                var tuple = database.iterators.SliceIterator{ .slice = item, .arity = item.len };
                 discovered_new = discovered_new or
                     try self.db.insert(rule.head.relation, tuple.iterator(), allocator) > 0;
             }
@@ -267,7 +267,7 @@ pub const Evaluator = struct {
                 self.domain.decodeTuple(tuple, decoded);
                 try writer.print("{s}(", .{entry.key_ptr.name});
                 for (decoded, 0..) |elem, j| {
-                    try writer.print("{s}", .{elem.seq});
+                    try writer.print("{s}", .{elem.binary});
                     if (j + 1 < decoded.len) {
                         try writer.print(",", .{});
                     }

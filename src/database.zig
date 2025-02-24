@@ -206,14 +206,6 @@ pub const TupleIterator = struct {
     }
 };
 
-/// Test whether tuple matches the specified pattern.
-pub fn matches(pattern: []const ?u64, tuple: []const u64) bool {
-    for (pattern, 0..) |pat, j| {
-        if (pat) |q| if (q != tuple[j]) return false;
-    }
-    return true;
-}
-
 /// Namespace for common tuple iterators.
 pub const iterators = struct {
     pub const SliceIterator = struct {
@@ -263,9 +255,68 @@ pub const iterators = struct {
             const self: *PatternIterator = @ptrCast(@alignCast(ptr));
             assert(self.pattern.len == into.len);
             while (self.parent.next(into)) {
-                if (matches(self.pattern, into)) return true;
+                if (tuples.matches(self.pattern, into)) return true;
             }
             return false;
+        }
+    };
+};
+
+/// Common tuple utilities;
+const tuples = struct {
+    /// Test whether tuple matches the specified pattern.
+    fn matches(pattern: []const ?u64, tuple: []const u64) bool {
+        for (pattern, 0..) |pat, j| {
+            if (pat) |q| if (q != tuple[j]) return false;
+        }
+        return true;
+    }
+
+    const Ordering = struct {
+        dimension: usize,
+        fn compare(self: Ordering, this: []const u64, that: []const u64) std.math.Order {
+            return std.math.order(this[self.dimension], that[self.dimension]);
+        }
+    };
+
+    const Collection = struct {
+        arity: usize,
+        array: ArrayListUnmanaged(u64) = .{},
+        fn deinit(self: *Collection, allocator: Allocator) void {
+            self.array.deinit(allocator);
+        }
+        inline fn elementAt(self: *Collection, index: usize, elem: usize) u64 {
+            return self.array.items[index * self.arity + elem];
+        }
+        inline fn tupleAt(self: *Collection, index: usize) []u64 {
+            return self.array.items[index * self.arity .. self.arity + index * self.arity];
+        }
+        fn each(self: *Collection, allocator: Allocator) Allocator.Error!TupleIterator {
+            const it = try allocator.create(iterators.SliceIterator);
+            it.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.array.items };
+            return it.iterator();
+        }
+    };
+
+    /// Perform operations on a slice that contains tuples of specified arity.
+    const MutableSlice = struct {
+        arity: usize,
+        slice: []u64,
+        inline fn tupleAt(self: *MutableSlice, index: usize) []u64 {
+            return self.slice[index * self.arity .. self.arity + index * self.arity];
+        }
+        /// Swaps two tuples in a slice using a temporary buffer.
+        fn swap(
+            self: *MutableSlice,
+            this: usize,
+            that: usize,
+            temp: []u64,
+        ) void {
+            assert(this != that);
+            assert(temp.len == self.arity);
+            @memcpy(temp, self.tupleAt(this));
+            @memcpy(self.tupleAt(this), self.tupleAt(that));
+            @memcpy(self.tupleAt(that), temp);
         }
     };
 };
@@ -317,16 +368,16 @@ pub const QueryBackend = struct {
 
 /// K-dimensional tree as in-memory tuple storage and query backend.
 /// Unlike convensional k-d trees, this one does not allow duplicates.
-pub const KDTree = struct {
+/// Optimized for fast insertion, not fast querying, may produce unbalanced trees,
+/// but it exist primarity for a small performance gain for IDB.
+pub const DynamicKDTree = struct {
     allocator: Allocator,
-    /// Tree dimensions (arity) of indexed tuples.
-    arity: usize,
     /// Tuples are copied into a single continuous array of element values.
     /// Since datalog database never shrinks and deletion is not required,
     /// every insert populated the end of the list.
     /// Because of this, tuples and nodes have identical indexes.
-    tuples: ArrayListUnmanaged(u64) = .{},
     nodes: ArrayListUnmanaged(Node) = .{},
+    tuples: tuples.Collection,
 
     /// Each node saves only the hash of the tuple to detect duplicates,
     /// and index pointers to the left and right nodes.
@@ -338,16 +389,6 @@ pub const KDTree = struct {
         right: usize = 0,
     };
 
-    /// Returns view to of elements of a tuple at `index`.
-    inline fn tupleSliceAt(self: *KDTree, index: usize) []const u64 {
-        return self.tuples.items[index * self.arity .. self.arity + index * self.arity];
-    }
-
-    /// Shortcut function to get tuple's element at specified index.
-    inline fn tupleElementAt(self: *KDTree, index: usize, elem: usize) u64 {
-        return self.tuples.items[index * self.arity + elem];
-    }
-
     const LookupSlotOutcome = union(enum) {
         duplicate,
         vacant: *usize,
@@ -355,7 +396,7 @@ pub const KDTree = struct {
 
     /// Try to find a vacant leaf pointer in the tree.
     /// Returns a pointer to `left` or `right` fields of a target Node struct.
-    fn lookupSlot(self: *KDTree, tuple: []const u64, hash: u64) LookupSlotOutcome {
+    fn lookupSlot(self: *DynamicKDTree, tuple: []const u64, hash: u64) LookupSlotOutcome {
         // Insert root node as an edge-case without calling this function.
         // If node list is empty, tree has nowhere to write new node index.
         assert(0 < self.nodes.items.len);
@@ -365,13 +406,13 @@ pub const KDTree = struct {
         // or the next node to check.
         while (true) {
             const node = &self.nodes.items[index];
-            const comp = self.tupleElementAt(index, depth % self.arity);
-            const proj = tuple[depth % self.arity];
+            const comp = self.tuples.elementAt(index, depth % self.tuples.arity);
+            const proj = tuple[depth % self.tuples.arity];
             const next: *usize = next: {
                 if (proj == comp) {
                     // Do a fast hash-collision check first:
                     if (hash == node.hash) {
-                        if (mem.eql(u64, tuple, self.tupleSliceAt(index))) {
+                        if (mem.eql(u64, tuple, self.tuples.tupleAt(index))) {
                             return .duplicate;
                         }
                     }
@@ -388,7 +429,7 @@ pub const KDTree = struct {
         }
     }
 
-    fn insert(self: *KDTree, tuple: []const u64) Allocator.Error!bool {
+    fn insert(self: *DynamicKDTree, tuple: []const u64) Allocator.Error!bool {
         const hash = Wyhash.hash(0, mem.sliceAsBytes(tuple));
         const next = self.nodes.items.len;
         if (0 < next) {
@@ -397,33 +438,27 @@ pub const KDTree = struct {
                 .vacant => |ptr| ptr.* = next,
             }
         }
-        try self.tuples.appendSlice(self.allocator, tuple);
+        try self.tuples.array.appendSlice(self.allocator, tuple);
         const node = try self.nodes.addOne(self.allocator);
         node.* = .{ .hash = hash };
         return true;
     }
 
     fn insertFromIterator(
-        self: *KDTree,
+        self: *DynamicKDTree,
         source: TupleIterator,
         allocator: Allocator,
     ) Allocator.Error!usize {
         var count: usize = 0;
-        const buffer = try allocator.alloc(u64, self.arity);
+        const buffer = try allocator.alloc(u64, self.tuples.arity);
         while (source.next(buffer)) {
             if (try self.insert(buffer)) count += 1;
         }
         return count;
     }
 
-    fn each(self: *KDTree, allocator: Allocator) Allocator.Error!TupleIterator {
-        const it = try allocator.create(iterators.SliceIterator);
-        it.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.tuples.items };
-        return it.iterator();
-    }
-
     fn query(
-        self: *KDTree,
+        self: *DynamicKDTree,
         pattern: []const ?u64,
         allocator: Allocator,
     ) Allocator.Error!TupleIterator {
@@ -440,19 +475,19 @@ pub const KDTree = struct {
         return it.iterator();
     }
 
-    pub fn deinit(self: *KDTree) void {
+    pub fn deinit(self: *DynamicKDTree) void {
         self.tuples.deinit(self.allocator);
         self.nodes.deinit(self.allocator);
     }
 
-    pub fn storage(self: *KDTree) TupleStorage {
+    pub fn storage(self: *DynamicKDTree) TupleStorage {
         const interface = struct {
             fn insertFn(
                 ptr: *anyopaque,
                 source: TupleIterator,
                 allocator: Allocator,
             ) Allocator.Error!usize {
-                const target: *KDTree = @ptrCast(@alignCast(ptr));
+                const target: *DynamicKDTree = @ptrCast(@alignCast(ptr));
                 return target.insertFromIterator(source, allocator);
             }
         };
@@ -462,22 +497,22 @@ pub const KDTree = struct {
         };
     }
 
-    pub fn queries(self: *KDTree) QueryBackend {
+    pub fn queries(self: *DynamicKDTree) QueryBackend {
         const interface = struct {
             fn queryFn(
                 ptr: *anyopaque,
                 pattern: []const ?u64,
                 allocator: Allocator,
             ) Allocator.Error!TupleIterator {
-                const target: *KDTree = @ptrCast(@alignCast(ptr));
+                const target: *DynamicKDTree = @ptrCast(@alignCast(ptr));
                 return target.query(pattern, allocator);
             }
             fn eachFn(
                 ptr: *anyopaque,
                 allocator: Allocator,
             ) Allocator.Error!TupleIterator {
-                const target: *KDTree = @ptrCast(@alignCast(ptr));
-                return target.each(allocator);
+                const target: *DynamicKDTree = @ptrCast(@alignCast(ptr));
+                return target.tuples.each(allocator);
             }
         };
         return .{
@@ -501,7 +536,7 @@ pub const KDTree = struct {
 
         allocator: Allocator,
         pattern: []const ?u64,
-        tree: *KDTree,
+        tree: *DynamicKDTree,
         queue: Queue,
 
         pub fn iterator(self: *QueryIterator) TupleIterator {
@@ -517,12 +552,12 @@ pub const KDTree = struct {
             const self: *QueryIterator = @ptrCast(@alignCast(ptr));
             assert(self.pattern.len == into.len);
             while (self.queue.readItem()) |state| {
-                const elem = state.depth % self.tree.arity;
+                const elem = state.depth % self.tree.tuples.arity;
                 const node = &self.tree.nodes.items[state.index];
                 if (self.pattern[elem]) |pat| {
                     // If current depth's element is defined in the pattern,
                     // pick the corrent subtree for traversal.
-                    const comp = self.tree.tupleElementAt(state.index, elem);
+                    const comp = self.tree.tuples.elementAt(state.index, elem);
                     if (pat < comp) {
                         if (0 < node.left) try self.queue.writeItem(state.descend(node.left));
                     } else {
@@ -533,8 +568,8 @@ pub const KDTree = struct {
                     if (0 < node.left) try self.queue.writeItem(state.descend(node.left));
                     if (0 < node.right) try self.queue.writeItem(state.descend(node.right));
                 }
-                const tuple = self.tree.tupleSliceAt(state.index);
-                if (matches(self.pattern, tuple)) {
+                const tuple = self.tree.tuples.tupleAt(state.index);
+                if (tuples.matches(self.pattern, tuple)) {
                     @memcpy(into, tuple);
                     return true;
                 }
@@ -542,65 +577,7 @@ pub const KDTree = struct {
             return false;
         }
     };
-
-    pub fn backup(self: *KDTree, into: std.io.AnyWriter) !void {
-        try into.writeInt(usize, self.arity, endian);
-        try into.writeInt(usize, self.nodes.items.len, endian);
-        for (self.nodes.items) |node| {
-            try into.writeStructEndian(node, endian);
-        }
-        try into.writeAll(mem.sliceAsBytes(self.tuples.items));
-    }
-
-    pub fn restore(from: std.io.AnyReader, allocator: Allocator) !KDTree {
-        const tree_arity = try from.readInt(usize, endian);
-        const tree_size = try from.readInt(usize, endian);
-        const tree_nodes: []Node = try allocator.alloc(Node, tree_size);
-        for (0..tree_size) |j| {
-            tree_nodes[j] = try from.readStructEndian(Node, endian);
-        }
-        const tree_tuples = try allocator.alloc(u64, tree_arity * tree_size);
-        const target_binary = mem.sliceAsBytes(tree_tuples);
-        const read = try from.readAll(target_binary);
-        if (read < target_binary.len) return error.CorruptInput;
-        return KDTree{
-            .allocator = allocator,
-            .arity = tree_arity,
-            .nodes = ArrayListUnmanaged(Node){
-                .items = tree_nodes,
-                .capacity = tree_nodes.len,
-            },
-            .tuples = ArrayListUnmanaged(u64){
-                .items = tree_tuples,
-                .capacity = tree_tuples.len,
-            },
-        };
-    }
 };
-
-test "KDTree: backup and restore" {
-    var arena = ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var output = ArrayList(u8).init(allocator);
-    var source = KDTree{ .allocator = allocator, .arity = 2 };
-    {
-        _ = try source.insert(&[_]u64{ 1, 0 });
-        _ = try source.insert(&[_]u64{ 0, 2 });
-        _ = try source.insert(&[_]u64{ 2, 1 });
-        const writer = output.writer();
-        try source.backup(writer.any());
-    }
-    const target = target: {
-        var buffer = std.io.fixedBufferStream(output.items);
-        const reader = buffer.reader();
-        break :target try KDTree.restore(reader.any(), allocator);
-    };
-    try std.testing.expect(mem.eql(u64, source.tuples.items, target.tuples.items));
-    for (source.nodes.items, target.nodes.items) |s, t| {
-        try std.testing.expect(std.meta.eql(s, t));
-    }
-}
 
 /// Identifies relation by name and relation arity.
 /// Each relation in database corresponds to a specific relation backend.
@@ -625,17 +602,16 @@ pub const Relation = struct {
 pub const Db = struct {
     const load_factor = std.hash_map.default_max_load_percentage;
     allocator: Allocator,
-    relations: std.HashMapUnmanaged(Relation, *KDTree, Relation.Equality, load_factor) = .{},
+    relations: std.HashMapUnmanaged(Relation, *DynamicKDTree, Relation.Equality, load_factor) = .{},
     pub fn create(allocator: Allocator) Db {
         return .{ .allocator = allocator };
     }
     pub fn setListRelationBackend(self: *Db, relation: Relation) Allocator.Error!void {
         if (!self.relations.contains(relation)) {
-            const backend = try self.allocator.create(KDTree);
-            errdefer self.allocator.destroy(backend);
+            const backend = try self.allocator.create(DynamicKDTree);
             backend.* = .{
                 .allocator = self.allocator,
-                .arity = relation.arity,
+                .tuples = tuples.Collection{ .arity = relation.arity },
             };
             try self.relations.put(self.allocator, relation, backend);
         }

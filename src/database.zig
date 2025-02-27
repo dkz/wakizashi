@@ -18,6 +18,7 @@ const ArrayList = std.ArrayList;
 const ArrayListUnmanaged = std.ArrayListUnmanaged;
 const HashMapUnmanaged = std.HashMapUnmanaged;
 const Wyhash = std.hash.Wyhash;
+const Random = std.Random;
 
 const AnyWriter = std.io.AnyWriter;
 const AnyReader = std.io.AnyReader;
@@ -272,51 +273,123 @@ const tuples = struct {
         return true;
     }
 
-    const Ordering = struct {
-        dimension: usize,
-        fn compare(self: Ordering, this: []const u64, that: []const u64) std.math.Order {
-            return std.math.order(this[self.dimension], that[self.dimension]);
-        }
-    };
-
-    const Collection = struct {
+    /// Stores tuples of same arity side by side in an array list,
+    /// and provides a slice iterator for contents.
+    const DirectCollection = struct {
         arity: usize,
         array: ArrayListUnmanaged(u64) = .{},
-        fn deinit(self: *Collection, allocator: Allocator) void {
+        fn deinit(self: *DirectCollection, allocator: Allocator) void {
             self.array.deinit(allocator);
         }
-        inline fn elementAt(self: *Collection, index: usize, elem: usize) u64 {
+        inline fn insert(
+            self: *DirectCollection,
+            allocator: Allocator,
+            tuple: []const u64,
+        ) Allocator.Error!void {
+            assert(self.arity == tuple.len);
+            return self.array.appendSlice(allocator, tuple);
+        }
+        inline fn length(self: *DirectCollection) usize {
+            return self.array.items.len / self.arity;
+        }
+        inline fn elementAt(self: *DirectCollection, index: usize, elem: usize) u64 {
             return self.array.items[index * self.arity + elem];
         }
-        inline fn tupleAt(self: *Collection, index: usize) []u64 {
+        inline fn tupleAt(self: *DirectCollection, index: usize) []u64 {
             return self.array.items[index * self.arity .. self.arity + index * self.arity];
         }
-        fn each(self: *Collection, allocator: Allocator) Allocator.Error!TupleIterator {
+        fn iterator(self: *DirectCollection, allocator: Allocator) Allocator.Error!TupleIterator {
             const it = try allocator.create(iterators.SliceIterator);
             it.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.array.items };
             return it.iterator();
         }
+        fn fromIterator(
+            arity: usize,
+            it: TupleIterator,
+            allocator: Allocator,
+        ) Allocator.Error!DirectCollection {
+            var target = DirectCollection{ .arity = arity };
+            const buffer = try allocator.alloc(u64, arity);
+            defer allocator.free(buffer);
+            while (it.next(buffer)) try target.insert(allocator, buffer);
+            return target;
+        }
     };
 
-    /// Perform operations on a slice that contains tuples of specified arity.
-    const MutableSlice = struct {
-        arity: usize,
-        slice: []u64,
-        inline fn tupleAt(self: *MutableSlice, index: usize) []u64 {
-            return self.slice[index * self.arity .. self.arity + index * self.arity];
+    /// Hoare's k-smallest selection algorithm based on Lomuto partition scheme,
+    /// adapted for multi-dimensional tuples. Uses many-item pointers to avoid memcpy.
+    const quickselect = struct {
+        /// While Lomuto scheme performs more swaps, it guarantees that perition index
+        /// contains the pivot element. Hoare's scheme can't guarantee that pivot element
+        /// lands at parition index which becomes extremelly annoying for locating a median.
+        fn partition(
+            list: [][*]const u64,
+            lower_index_inclusive: usize,
+            upper_index_inclusive: usize,
+            pivot_index: usize,
+            component: usize,
+        ) usize {
+            assert(lower_index_inclusive < upper_index_inclusive);
+            const pivot = list[pivot_index];
+            {
+                const t = list[upper_index_inclusive];
+                list[upper_index_inclusive] = list[pivot_index];
+                list[pivot_index] = t;
+            }
+            var store = lower_index_inclusive;
+            for (lower_index_inclusive..upper_index_inclusive) |j| {
+                if (list[j][component] < pivot[component]) {
+                    const t = list[store];
+                    list[store] = list[j];
+                    list[j] = t;
+                    store += 1;
+                }
+            }
+            {
+                const t = list[store];
+                list[store] = list[upper_index_inclusive];
+                list[upper_index_inclusive] = t;
+            }
+            return store;
         }
-        /// Swaps two tuples in a slice using a temporary buffer.
-        fn swap(
-            self: *MutableSlice,
-            this: usize,
-            that: usize,
-            temp: []u64,
-        ) void {
-            assert(this != that);
-            assert(temp.len == self.arity);
-            @memcpy(temp, self.tupleAt(this));
-            @memcpy(self.tupleAt(this), self.tupleAt(that));
-            @memcpy(self.tupleAt(that), temp);
+        /// K-smallest quick select using Lomuto scheme defined above.
+        fn select(
+            list: [][*]const u64,
+            with_lower_index_inclusive: usize,
+            with_upper_index_inclusive: usize,
+            index: usize,
+            component: usize,
+            random: Random,
+        ) usize {
+            assert(with_lower_index_inclusive < with_upper_index_inclusive);
+            var state: struct { usize, usize } = .{
+                with_lower_index_inclusive,
+                with_upper_index_inclusive,
+            };
+            while (true) {
+                const lower, const upper = state;
+                if (lower == upper) {
+                    return lower;
+                }
+                const pi = random.intRangeAtMostBiased(usize, lower, upper);
+                const split = partition(list, lower, upper, pi, component);
+                if (split == index) {
+                    return split;
+                } else if (index < split) {
+                    state = .{ lower, split - 1 };
+                } else {
+                    state = .{ split + 1, upper };
+                }
+            }
+        }
+        fn median(
+            list: [][*]const u64,
+            component: usize,
+            random: Random,
+        ) struct { [][*]const u64, usize, [][*]const u64 } {
+            assert(0 < list.len);
+            const i = select(list, 0, list.len - 1, list.len / 2, component, random);
+            return .{ list[0..i], i, list[i + 1 .. list.len] };
         }
     };
 };
@@ -377,7 +450,7 @@ pub const DynamicKDTree = struct {
     /// every insert populated the end of the list.
     /// Because of this, tuples and nodes have identical indexes.
     nodes: ArrayListUnmanaged(Node) = .{},
-    tuples: tuples.Collection,
+    tuples: tuples.DirectCollection,
 
     /// Each node saves only the hash of the tuple to detect duplicates,
     /// and index pointers to the left and right nodes.
@@ -438,7 +511,7 @@ pub const DynamicKDTree = struct {
                 .vacant => |ptr| ptr.* = next,
             }
         }
-        try self.tuples.array.appendSlice(self.allocator, tuple);
+        try self.tuples.insert(self.allocator, tuple);
         const node = try self.nodes.addOne(self.allocator);
         node.* = .{ .hash = hash };
         return true;
@@ -512,7 +585,7 @@ pub const DynamicKDTree = struct {
                 allocator: Allocator,
             ) Allocator.Error!TupleIterator {
                 const target: *DynamicKDTree = @ptrCast(@alignCast(ptr));
-                return target.tuples.each(allocator);
+                return target.tuples.iterator(allocator);
             }
         };
         return .{
@@ -611,7 +684,7 @@ pub const Db = struct {
             const backend = try self.allocator.create(DynamicKDTree);
             backend.* = .{
                 .allocator = self.allocator,
-                .tuples = tuples.Collection{ .arity = relation.arity },
+                .tuples = tuples.DirectCollection{ .arity = relation.arity },
             };
             try self.relations.put(self.allocator, relation, backend);
         }

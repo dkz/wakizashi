@@ -207,6 +207,44 @@ pub const TupleIterator = struct {
     }
 };
 
+/// Another abstract tuple iterator but for not-owned memory.
+/// Exists to avoid copying data for static k-d tree construction.
+pub const PointerIterator = struct {
+    ptr: *anyopaque,
+    nextFn: *const fn (ctx: *anyopaque) ?[*]const u64,
+    destroyFn: *const fn (ctx: *anyopaque) void,
+    pub fn next(self: *const PointerIterator) ?[*]const u64 {
+        return self.nextFn(self.ptr);
+    }
+    pub fn destroy(self: *const PointerIterator) void {
+        self.destroyFn(self.ptr);
+    }
+    /// Transforms this MemoryIterator into TupleIterator,
+    /// by adding a memcpy call to .next().
+    pub fn iterator(context: *const PointerIterator) TupleIterator {
+        const interface = struct {
+            fn nextFn(ptr: *anyopaque, into: []u64) bool {
+                const self: *PointerIterator = @ptrCast(@alignCast(ptr));
+                if (self.next()) |t| {
+                    @memcpy(into, t[0..into.len]);
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            fn destroyFn(ptr: *anyopaque) void {
+                const self: *PointerIterator = @ptrCast(@alignCast(ptr));
+                self.destroy();
+            }
+        };
+        return TupleIterator{
+            .ptr = context,
+            .nextFn = interface.nextFn,
+            .destroyFn = interface.destroyFn,
+        };
+    }
+};
+
 /// Namespace for common tuple iterators.
 pub const iterators = struct {
     pub const SliceIterator = struct {
@@ -215,25 +253,55 @@ pub const iterators = struct {
         slice: []const u64,
         index: usize = 0,
         arity: usize,
-        pub fn iterator(self: *SliceIterator) TupleIterator {
-            return .{ .ptr = self, .nextFn = next, .destroyFn = destroy };
+        pub fn iterator(context: *SliceIterator) TupleIterator {
+            const interface = struct {
+                fn destroyFn(ptr: *anyopaque) void {
+                    const self: *SliceIterator = @ptrCast(@alignCast(ptr));
+                    if (self.allocator) |allocator| allocator.destroy(self);
+                }
+                fn nextFn(ptr: *anyopaque, into: []u64) bool {
+                    const self: *SliceIterator = @ptrCast(@alignCast(ptr));
+                    assert(self.arity == into.len);
+                    const a = self.arity;
+                    const i = self.index;
+                    if (i * a < self.slice.len) {
+                        self.index += 1;
+                        @memcpy(into, self.slice[i * a .. a + i * a]);
+                        return true;
+                    } else {
+                        return false;
+                    }
+                }
+            };
+            return .{
+                .ptr = context,
+                .nextFn = interface.nextFn,
+                .destroyFn = interface.destroyFn,
+            };
         }
-        fn destroy(ptr: *anyopaque) void {
-            const self: *SliceIterator = @ptrCast(@alignCast(ptr));
-            if (self.allocator) |allocator| allocator.destroy(self);
-        }
-        fn next(ptr: *anyopaque, into: []u64) bool {
-            const self: *SliceIterator = @ptrCast(@alignCast(ptr));
-            assert(self.arity == into.len);
-            const a = self.arity;
-            const i = self.index;
-            if (i * a < self.slice.len) {
-                self.index += 1;
-                @memcpy(into, self.slice[i * a .. a + i * a]);
-                return true;
-            } else {
-                return false;
-            }
+        pub fn pointers(context: *SliceIterator) PointerIterator {
+            const interface = struct {
+                fn destroyFn(ptr: *anyopaque) void {
+                    const self: *SliceIterator = @ptrCast(@alignCast(ptr));
+                    if (self.allocator) |allocator| allocator.destroy(self);
+                }
+                fn nextFn(ptr: *anyopaque) ?[*]const u64 {
+                    const self: *SliceIterator = @ptrCast(@alignCast(ptr));
+                    const a = self.arity;
+                    const i = self.index;
+                    if (i * a < self.slice.len) {
+                        self.index += 1;
+                        return self.slice[i * a ..].ptr;
+                    } else {
+                        return null;
+                    }
+                }
+            };
+            return .{
+                .ptr = context,
+                .nextFn = interface.nextFn,
+                .destroyFn = interface.destroyFn,
+            };
         }
     };
     /// Yields tuples from parent iterator,
@@ -302,6 +370,11 @@ const tuples = struct {
             const it = try allocator.create(iterators.SliceIterator);
             it.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.array.items };
             return it.iterator();
+        }
+        fn pointers(self: *DirectCollection, allocator: Allocator) PointerIterator {
+            const it = try allocator.create(iterators.SliceIterator);
+            it.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.array.items };
+            return it.pointers();
         }
         fn fromIterator(
             arity: usize,
@@ -593,6 +666,10 @@ pub const DynamicKDTree = struct {
             .queryFn = interface.queryFn,
             .eachFn = interface.eachFn,
         };
+    }
+
+    pub fn pointers(self: *DynamicKDTree, allocator: Allocator) PointerIterator {
+        return self.tuples.pointers(allocator);
     }
 
     /// BFS in the tree cutting subtrees according to pattern.

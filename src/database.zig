@@ -22,6 +22,7 @@ const Random = std.Random;
 
 const AnyWriter = std.io.AnyWriter;
 const AnyReader = std.io.AnyReader;
+const StreamSource = std.io.StreamSource;
 
 /// Supported datatypes in database tuples.
 /// For simplicity, every value corresponds only to a binary blob.
@@ -219,6 +220,16 @@ pub const PointerIterator = struct {
     pub fn destroy(self: *const PointerIterator) void {
         self.destroyFn(self.ptr);
     }
+    /// Consume all pointers into a pointer slice.
+    pub fn consume(
+        context: *const PointerIterator,
+        allocator: Allocator,
+    ) Allocator.Error![][*]const u64 {
+        var coll = ArrayList([*]const u64).init(allocator);
+        defer coll.deinit();
+        while (context.next()) |p| try coll.append(p);
+        return coll.toOwnedSlice();
+    }
     /// Transforms this MemoryIterator into TupleIterator,
     /// by adding a memcpy call to .next().
     pub fn iterator(context: *const PointerIterator) TupleIterator {
@@ -371,7 +382,7 @@ const tuples = struct {
             it.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.array.items };
             return it.iterator();
         }
-        fn pointers(self: *DirectCollection, allocator: Allocator) PointerIterator {
+        fn pointers(self: *DirectCollection, allocator: Allocator) Allocator.Error!PointerIterator {
             const it = try allocator.create(iterators.SliceIterator);
             it.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.array.items };
             return it.pointers();
@@ -512,6 +523,221 @@ pub const QueryBackend = struct {
     }
 };
 
+/// Binary K-dimentional tree format for storing static, balanced trees in files.
+const kdf = struct {
+    /// Each tree node starts with a header, followed by tuple data record.
+    /// Node header stores offsets to the left subtree (lt) and the right (ge).
+    /// Zero offset means there's no child.
+    const NodeHeader = extern struct {
+        lt: usize = 0,
+        ge: usize = 0,
+    };
+
+    /// ArrayList's slice and its address gets invalidated after growth,
+    /// so instead of pointers, export code uses MemoryStored to keep
+    /// an offset inside an ArrayList, enabling quick reference via ptr().
+    const MemoryStored = struct {
+        offset: usize,
+        inline fn ptr(self: *const MemoryStored, in: *ArrayList(u8)) *NodeHeader {
+            return @alignCast(mem.bytesAsValue(NodeHeader, in.items[self.offset..]));
+        }
+    };
+
+    /// Stores a single tuple into memory block, prepending a header to it.
+    /// Returns header's MemoryStored, used later to store a correct offset
+    /// to it's children.
+    fn exportNode(into: *ArrayList(u8), tuple: []const u64) Allocator.Error!MemoryStored {
+        const offset = into.items.len;
+        try into.appendSlice(mem.asBytes(&NodeHeader{}));
+        try into.appendSlice(mem.sliceAsBytes(tuple));
+        return MemoryStored{ .offset = offset };
+    }
+
+    /// Reads node header and the corresponding tuple at current position,
+    /// following binary format defined by exportNode().
+    fn importNode(from: *StreamSource, into: []u64) !?NodeHeader {
+        const reader = from.reader();
+        const header = header: {
+            var nb: [@sizeOf(NodeHeader)]u8 = undefined;
+            reader.readNoEof(&nb) catch |e| switch (e) {
+                error.EndOfStream => return null,
+                else => return e,
+            };
+            break :header mem.bytesToValue(NodeHeader, &nb);
+        };
+        reader.readNoEof(mem.sliceAsBytes(into)) catch |e| switch (e) {
+            error.EndOfStream => return null,
+            else => return e,
+        };
+        return header;
+    }
+
+    const SubtreeType = enum { lt, ge };
+    const ExportState = struct {
+        t: SubtreeType,
+        parent: MemoryStored,
+        subtree: [][*]const u64,
+        depth: usize,
+        fn descendLt(
+            self: ExportState,
+            header: MemoryStored,
+            lt: [][*]const u64,
+        ) ExportState {
+            return .{
+                .t = .lt,
+                .parent = header,
+                .subtree = lt,
+                .depth = 1 + self.depth,
+            };
+        }
+        fn descendGe(
+            self: ExportState,
+            header: MemoryStored,
+            ge: [][*]const u64,
+        ) ExportState {
+            return .{
+                .t = .ge,
+                .parent = header,
+                .subtree = ge,
+                .depth = 1 + self.depth,
+            };
+        }
+    };
+
+    fn exportSubtrees(
+        arity: usize,
+        into: *ArrayList(u8),
+        stack: *ArrayList(ExportState),
+        random: Random,
+    ) Allocator.Error!void {
+        while (stack.popOrNull()) |from| {
+            if (1 < from.subtree.len) {
+                const lt, const median, const ge =
+                    tuples.quickselect.median(from.subtree, from.depth % arity, random);
+                const stored = try exportNode(into, from.subtree[median][0..arity]);
+                const parent = from.parent.ptr(into);
+                switch (from.t) {
+                    .lt => parent.lt = stored.offset,
+                    .ge => parent.ge = stored.offset,
+                }
+                if (0 < ge.len) try stack.append(from.descendGe(stored, ge));
+                if (0 < lt.len) try stack.append(from.descendLt(stored, lt));
+            } else {
+                const stored = try exportNode(into, from.subtree[0][0..arity]);
+                const parent = from.parent.ptr(into);
+                switch (from.t) {
+                    .lt => parent.lt = stored.offset,
+                    .ge => parent.ge = stored.offset,
+                }
+            }
+        }
+    }
+
+    /// Export a set of tuples into a static in-memory k-d tree buffer.
+    fn exportTree(
+        arity: usize,
+        into: *ArrayList(u8),
+        from: [][*]const u64,
+        allocator: Allocator,
+    ) Allocator.Error!void {
+        if (1 < from.len) {
+            var rng = Random.Xoroshiro128.init(@bitCast(std.time.microTimestamp()));
+            var stack = ArrayList(ExportState).init(allocator);
+            defer stack.deinit();
+            const lt, const median, const ge =
+                tuples.quickselect.median(from, 0, rng.random());
+            const header = try exportNode(into, from[median][0..arity]);
+            if (0 < ge.len) try stack.append(.{
+                .t = .ge,
+                .depth = 1,
+                .parent = header,
+                .subtree = ge,
+            });
+            if (0 < lt.len) try stack.append(.{
+                .t = .lt,
+                .depth = 1,
+                .parent = header,
+                .subtree = lt,
+            });
+            return exportSubtrees(arity, into, &stack, rng.random());
+        } else {
+            _ = try exportNode(into, from[0][0..arity]);
+        }
+    }
+
+    const EachIterator = struct {
+        /// Null for on-stack iterators.
+        allocator: ?Allocator = null,
+        /// Make sure source is not shared, as position might jump between calls
+        /// and iterator becomes inconsistent.
+        source: StreamSource,
+        arity: usize,
+        pub fn iterator(self: *EachIterator) TupleIterator {
+            return .{ .ptr = self, .destroyFn = destroy, .nextFn = next };
+        }
+        fn destroy(ptr: *anyopaque) void {
+            const self: *EachIterator = @ptrCast(@alignCast(ptr));
+            if (self.allocator) |allocator| allocator.destroy(self);
+        }
+        fn next(ptr: *anyopaque, into: []u64) bool {
+            errdefer unreachable;
+            const self: *EachIterator = @ptrCast(@alignCast(ptr));
+            const head = try importNode(&self.source, into);
+            return head != null;
+        }
+    };
+
+    /// Query iterator tailored for the described binary format.
+    const QueryIterator = struct {
+        const Stack = ArrayListUnmanaged(State);
+        const State = struct {
+            at: usize = 0,
+            depth: usize = 0,
+            fn descend(self: State, to: usize) State {
+                return .{ .at = to, .depth = 1 + self.depth };
+            }
+        };
+        arity: usize,
+        source: StreamSource,
+        pattern: []const ?u64,
+        allocator: Allocator,
+        stack: Stack = .{},
+        pub fn iterator(self: *QueryIterator) TupleIterator {
+            return .{ .ptr = self, .destroyFn = destroy, .nextFn = next };
+        }
+        fn destroy(ptr: *anyopaque) void {
+            const self: *QueryIterator = @ptrCast(@alignCast(ptr));
+            self.stack.deinit(self.allocator);
+            self.allocator.destroy(self);
+        }
+        fn next(ptr: *anyopaque, into: []u64) bool {
+            errdefer unreachable; // TODO make .next() also throw an error.
+            const self: *QueryIterator = @ptrCast(@alignCast(ptr));
+            assert(self.pattern.len == into.len);
+            while (self.stack.popOrNull()) |state| {
+                const elem = state.depth % self.arity;
+                try self.source.seekTo(state.at);
+                if (try importNode(&self.source, into)) |header| {
+                    if (self.pattern[elem]) |pat| {
+                        if (pat < into[elem]) {
+                            if (0 < header.lt)
+                                try self.stack.append(self.allocator, state.descend(header.lt));
+                        } else {
+                            if (0 < header.ge)
+                                try self.stack.append(self.allocator, state.descend(header.ge));
+                        }
+                    } else {
+                        if (0 < header.ge) try self.stack.append(self.allocator, state.descend(header.ge));
+                        if (0 < header.lt) try self.stack.append(self.allocator, state.descend(header.lt));
+                    }
+                    if (tuples.matches(self.pattern, into)) return true;
+                }
+            }
+            return false;
+        }
+    };
+};
+
 /// K-dimensional tree as in-memory tuple storage and query backend.
 /// Unlike convensional k-d trees, this one does not allow duplicates.
 /// Optimized for fast insertion, not fast querying, may produce unbalanced trees,
@@ -529,7 +755,7 @@ pub const DynamicKDTree = struct {
     /// and index pointers to the left and right nodes.
     /// Extern and packed structs do not allow optional unions,
     /// hence value 0 acts as an indicator of abcense (tree nodes can't point to root).
-    const Node = extern struct {
+    const Node = struct {
         hash: u64,
         left: usize = 0,
         right: usize = 0,

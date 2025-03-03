@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const mem = std.mem;
+const fmt = std.fmt;
 const builtin = @import("builtin");
 const endian = builtin.cpu.arch.endian();
 const assert = std.debug.assert;
@@ -23,6 +24,9 @@ const Random = std.Random;
 const AnyWriter = std.io.AnyWriter;
 const AnyReader = std.io.AnyReader;
 const StreamSource = std.io.StreamSource;
+
+const Dir = std.fs.Dir;
+const File = std.fs.File;
 
 /// Supported datatypes in database tuples.
 /// For simplicity, every value corresponds only to a binary blob.
@@ -208,54 +212,6 @@ pub const TupleIterator = struct {
     }
 };
 
-/// Another abstract tuple iterator but for not-owned memory.
-/// Exists to avoid copying data for static k-d tree construction.
-pub const PointerIterator = struct {
-    ptr: *anyopaque,
-    nextFn: *const fn (ctx: *anyopaque) ?[*]const u64,
-    destroyFn: *const fn (ctx: *anyopaque) void,
-    pub fn next(self: *const PointerIterator) ?[*]const u64 {
-        return self.nextFn(self.ptr);
-    }
-    pub fn destroy(self: *const PointerIterator) void {
-        self.destroyFn(self.ptr);
-    }
-    /// Consume all pointers into a pointer slice.
-    pub fn consume(
-        context: *const PointerIterator,
-        allocator: Allocator,
-    ) Allocator.Error![][*]const u64 {
-        var coll = ArrayList([*]const u64).init(allocator);
-        defer coll.deinit();
-        while (context.next()) |p| try coll.append(p);
-        return coll.toOwnedSlice();
-    }
-    /// Transforms this MemoryIterator into TupleIterator,
-    /// by adding a memcpy call to .next().
-    pub fn iterator(context: *const PointerIterator) TupleIterator {
-        const interface = struct {
-            fn nextFn(ptr: *anyopaque, into: []u64) bool {
-                const self: *PointerIterator = @ptrCast(@alignCast(ptr));
-                if (self.next()) |t| {
-                    @memcpy(into, t[0..into.len]);
-                    return true;
-                } else {
-                    return false;
-                }
-            }
-            fn destroyFn(ptr: *anyopaque) void {
-                const self: *PointerIterator = @ptrCast(@alignCast(ptr));
-                self.destroy();
-            }
-        };
-        return TupleIterator{
-            .ptr = context,
-            .nextFn = interface.nextFn,
-            .destroyFn = interface.destroyFn,
-        };
-    }
-};
-
 /// Namespace for common tuple iterators.
 pub const iterators = struct {
     pub const SliceIterator = struct {
@@ -281,30 +237,6 @@ pub const iterators = struct {
                         return true;
                     } else {
                         return false;
-                    }
-                }
-            };
-            return .{
-                .ptr = context,
-                .nextFn = interface.nextFn,
-                .destroyFn = interface.destroyFn,
-            };
-        }
-        pub fn pointers(context: *SliceIterator) PointerIterator {
-            const interface = struct {
-                fn destroyFn(ptr: *anyopaque) void {
-                    const self: *SliceIterator = @ptrCast(@alignCast(ptr));
-                    if (self.allocator) |allocator| allocator.destroy(self);
-                }
-                fn nextFn(ptr: *anyopaque) ?[*]const u64 {
-                    const self: *SliceIterator = @ptrCast(@alignCast(ptr));
-                    const a = self.arity;
-                    const i = self.index;
-                    if (i * a < self.slice.len) {
-                        self.index += 1;
-                        return self.slice[i * a ..].ptr;
-                    } else {
-                        return null;
                     }
                 }
             };
@@ -368,6 +300,15 @@ const tuples = struct {
             assert(self.arity == tuple.len);
             return self.array.appendSlice(allocator, tuple);
         }
+        inline fn insertFromIterator(
+            self: *DirectCollection,
+            it: TupleIterator,
+            allocator: Allocator,
+        ) Allocator.Error!void {
+            const buffer = try allocator.alloc(u64, self.arity);
+            defer allocator.free(buffer);
+            while (it.next(buffer)) try self.insert(allocator, buffer);
+        }
         inline fn length(self: *DirectCollection) usize {
             return self.array.items.len / self.arity;
         }
@@ -382,10 +323,10 @@ const tuples = struct {
             it.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.array.items };
             return it.iterator();
         }
-        fn pointers(self: *DirectCollection, allocator: Allocator) Allocator.Error!PointerIterator {
-            const it = try allocator.create(iterators.SliceIterator);
-            it.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.array.items };
-            return it.pointers();
+        fn pointers(self: *DirectCollection, allocator: Allocator) Allocator.Error![][*]const u64 {
+            const coll = try allocator.alloc([*]const u64, self.length());
+            for (0..self.length()) |j| coll[j] = self.tupleAt(j).ptr;
+            return coll;
         }
         fn fromIterator(
             arity: usize,
@@ -393,9 +334,7 @@ const tuples = struct {
             allocator: Allocator,
         ) Allocator.Error!DirectCollection {
             var target = DirectCollection{ .arity = arity };
-            const buffer = try allocator.alloc(u64, arity);
-            defer allocator.free(buffer);
-            while (it.next(buffer)) try target.insert(allocator, buffer);
+            try target.insertFromIterator(it, allocator);
             return target;
         }
     };
@@ -736,6 +675,20 @@ const kdf = struct {
             return false;
         }
     };
+
+    fn importAsIterator(
+        from: StreamSource,
+        arity: usize,
+        allocator: Allocator,
+    ) !TupleIterator {
+        const it = try allocator.create(EachIterator);
+        it.* = EachIterator{
+            .arity = arity,
+            .source = from,
+            .allocator = allocator,
+        };
+        return it.iterator();
+    }
 };
 
 /// K-dimensional tree as in-memory tuple storage and query backend.
@@ -894,10 +847,6 @@ pub const DynamicKDTree = struct {
         };
     }
 
-    pub fn pointers(self: *DynamicKDTree, allocator: Allocator) PointerIterator {
-        return self.tuples.pointers(allocator);
-    }
-
     /// BFS in the tree cutting subtrees according to pattern.
     const QueryIterator = struct {
         /// Tree doesn't store depth, so BFS forced to carry it along with node index.
@@ -953,6 +902,167 @@ pub const DynamicKDTree = struct {
             return false;
         }
     };
+};
+
+/// Block k-d tree backed by a forest directory of persisted k-d trees.
+/// Each bucket in the forest is a static balanced k-d tree of `base * 2^l` elements.
+/// Trees are either full or empty.
+const BlockKDTree = struct {
+    const base_size = 1024;
+    arity: usize,
+    allocator: Allocator,
+    staging: DynamicKDTree,
+    buckets: Dir,
+    fn open(arity: usize, directory: Dir, allocator: Allocator) !BlockKDTree {
+        var arena = ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const local = arena.allocator();
+        var staging = DynamicKDTree{
+            .allocator = allocator,
+            .tuples = tuples.DirectCollection{ .arity = arity },
+        };
+        import_staging: {
+            const file = directory.openFile("staging", .{}) catch |e| {
+                switch (e) {
+                    error.FileNotFound => break :import_staging,
+                    else => return e,
+                }
+            };
+            defer file.close();
+            var it = try kdf.importAsIterator(
+                StreamSource{ .file = file },
+                arity,
+                local,
+            );
+            defer it.destroy();
+            _ = try staging.insertFromIterator(it, local);
+        }
+        return BlockKDTree{
+            .arity = arity,
+            .allocator = allocator,
+            .buckets = directory,
+            .staging = staging,
+        };
+    }
+    fn flush(self: *BlockKDTree, allocator: Allocator) !void {
+        var arena = ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const local = arena.allocator();
+        const file = try self.buckets.createFile("staging", .{ .truncate = true });
+        defer file.close();
+        if (0 < self.staging.tuples.length()) {
+            var into = ArrayList(u8).init(local);
+            const source = try self.staging.tuples.pointers(local);
+            try kdf.exportTree(self.arity, &into, source, local);
+            try file.writeAll(into.items);
+        }
+    }
+    fn close(self: *BlockKDTree) void {
+        self.staging.deinit();
+        self.buckets.close();
+    }
+    fn insert(self: *BlockKDTree, tuple: []const u64, allocator: Allocator) !void {
+        _ = try self.staging.insert(tuple);
+        if (base_size <= self.staging.tuples.length()) {
+            var arena = ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const local = arena.allocator();
+            var merge = merge: {
+                const it = try self.staging.tuples.iterator(local);
+                var result = tuples.DirectCollection{ .arity = self.arity };
+                try result.insertFromIterator(it, local);
+                self.staging.deinit();
+                self.staging = DynamicKDTree{
+                    .allocator = self.allocator,
+                    .tuples = tuples.DirectCollection{ .arity = self.arity },
+                };
+                break :merge result;
+            };
+            var j: usize = 0;
+            while (true) : (j += 1) {
+                if (try self.importBucket(j, local)) |bucket| {
+                    try merge.insertFromIterator(try bucket.iterator(), local);
+                    bucket.destroy();
+                    try self.removeBucket(j);
+                } else {
+                    try self.exportBucket(j, &merge, local);
+                    return;
+                }
+            }
+        }
+    }
+    const BucketContext = struct {
+        file: File,
+        tree: *BlockKDTree,
+        allocator: Allocator,
+        fn iterator(self: *const BucketContext) !TupleIterator {
+            return try kdf.importAsIterator(
+                StreamSource{ .file = self.file },
+                self.tree.arity,
+                self.allocator,
+            );
+        }
+        fn destroy(self: *const BucketContext) void {
+            self.file.close();
+        }
+    };
+    fn importBucket(self: *BlockKDTree, index: usize, allocator: Allocator) !?BucketContext {
+        var buf: [256]u8 = undefined;
+        const file = self.buckets.openFile(
+            fmt.bufPrint(&buf, "{d}", .{index}) catch unreachable,
+            .{},
+        ) catch |e| switch (e) {
+            error.FileNotFound => {
+                return null;
+            },
+            else => return e,
+        };
+        return BucketContext{
+            .allocator = allocator,
+            .tree = self,
+            .file = file,
+        };
+    }
+    fn removeBucket(self: *BlockKDTree, index: usize) !void {
+        var buf: [256]u8 = undefined;
+        return self.buckets.deleteFile(
+            fmt.bufPrint(&buf, "{d}", .{index}) catch unreachable,
+        );
+    }
+    fn exportBucket(
+        self: *BlockKDTree,
+        index: usize,
+        from: *tuples.DirectCollection,
+        allocator: Allocator,
+    ) !void {
+        var arena = ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const local = arena.allocator();
+        var buf: [256]u8 = undefined;
+        const file = try self.buckets.createFile(
+            fmt.bufPrint(&buf, "{d}", .{index}) catch unreachable,
+            .{ .truncate = true },
+        );
+        defer file.close();
+        var into = ArrayList(u8).init(local);
+        const source = try from.pointers(local);
+        try kdf.exportTree(self.arity, &into, source, local);
+        try file.writeAll(into.items);
+    }
+    fn print(self: *BlockKDTree, allocator: Allocator) !void {
+        var arena = ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const local = arena.allocator();
+        std.debug.print("staging: {any}\n", .{self.staging.tuples.array.items});
+        for (0..10) |j| {
+            if (try self.importBucket(j, local)) |bucket| {
+                var temp = tuples.DirectCollection{ .arity = self.arity };
+                defer temp.deinit(local);
+                try temp.insertFromIterator(try bucket.iterator(), local);
+                std.debug.print("{d}: {any}\n", .{ j, temp.array.items });
+            }
+        }
+    }
 };
 
 /// Identifies relation by name and relation arity.

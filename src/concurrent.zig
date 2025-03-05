@@ -8,7 +8,7 @@ const Condition = std.Thread.Condition;
 const ThreadPool = std.Thread.Pool;
 
 /// Go-style channel using a fixed circular buffer under a mutex.
-fn Channel(comptime T: type, comptime size: u8) type {
+pub fn Channel(comptime T: type, comptime size: usize) type {
     return struct {
         const Self = @This();
         mutex: Mutex = .{},
@@ -17,7 +17,7 @@ fn Channel(comptime T: type, comptime size: u8) type {
         writer: usize = 0,
         recv_cond: Condition = .{},
         send_cond: Condition = .{},
-        fn send(self: *Self, message: T) void {
+        pub fn send(self: *Self, message: T) void {
             self.mutex.lock();
             defer self.mutex.unlock();
             while (true) {
@@ -31,7 +31,7 @@ fn Channel(comptime T: type, comptime size: u8) type {
                 }
             }
         }
-        fn recv(self: *Self) T {
+        pub fn recv(self: *Self) T {
             self.mutex.lock();
             defer self.mutex.unlock();
             while (true) {

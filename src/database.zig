@@ -12,14 +12,20 @@ const fmt = std.fmt;
 const builtin = @import("builtin");
 const endian = builtin.cpu.arch.endian();
 const assert = std.debug.assert;
+const panic = std.debug.panic;
 
 const Allocator = mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
+const ThreadSafeAllocator = std.heap.ThreadSafeAllocator;
 const ArrayList = std.ArrayList;
 const ArrayListUnmanaged = std.ArrayListUnmanaged;
 const HashMapUnmanaged = std.HashMapUnmanaged;
 const Wyhash = std.hash.Wyhash;
 const Random = std.Random;
+
+const concurrent = @import("concurrent.zig");
+const Channel = concurrent.Channel;
+const ThreadPool = std.Thread.Pool;
 
 const AnyWriter = std.io.AnyWriter;
 const AnyReader = std.io.AnyReader;
@@ -549,7 +555,7 @@ const kdf = struct {
         stack: *ArrayList(ExportState),
         random: Random,
     ) Allocator.Error!void {
-        while (stack.popOrNull()) |from| {
+        while (stack.pop()) |from| {
             if (1 < from.subtree.len) {
                 const lt, const median, const ge =
                     tuples.quickselect.median(from.subtree, from.depth % arity, random);
@@ -639,35 +645,34 @@ const kdf = struct {
         arity: usize,
         source: StreamSource,
         pattern: []const ?u64,
-        allocator: Allocator,
+        stack_allocator: Allocator,
         stack: Stack = .{},
         pub fn iterator(self: *QueryIterator) TupleIterator {
             return .{ .ptr = self, .destroyFn = destroy, .nextFn = next };
         }
         fn destroy(ptr: *anyopaque) void {
             const self: *QueryIterator = @ptrCast(@alignCast(ptr));
-            self.stack.deinit(self.allocator);
-            self.allocator.destroy(self);
+            self.stack.deinit(self.stack_allocator);
         }
         fn next(ptr: *anyopaque, into: []u64) bool {
             errdefer unreachable; // TODO make .next() also throw an error.
             const self: *QueryIterator = @ptrCast(@alignCast(ptr));
             assert(self.pattern.len == into.len);
-            while (self.stack.popOrNull()) |state| {
+            while (self.stack.pop()) |state| {
                 const elem = state.depth % self.arity;
                 try self.source.seekTo(state.at);
                 if (try importNode(&self.source, into)) |header| {
                     if (self.pattern[elem]) |pat| {
                         if (pat < into[elem]) {
                             if (0 < header.lt)
-                                try self.stack.append(self.allocator, state.descend(header.lt));
+                                try self.stack.append(self.stack_allocator, state.descend(header.lt));
                         } else {
                             if (0 < header.ge)
-                                try self.stack.append(self.allocator, state.descend(header.ge));
+                                try self.stack.append(self.stack_allocator, state.descend(header.ge));
                         }
                     } else {
-                        if (0 < header.ge) try self.stack.append(self.allocator, state.descend(header.ge));
-                        if (0 < header.lt) try self.stack.append(self.allocator, state.descend(header.lt));
+                        if (0 < header.ge) try self.stack.append(self.stack_allocator, state.descend(header.ge));
+                        if (0 < header.lt) try self.stack.append(self.stack_allocator, state.descend(header.lt));
                     }
                     if (tuples.matches(self.pattern, into)) return true;
                 }
@@ -991,6 +996,152 @@ const BlockKDTree = struct {
             }
         }
     }
+
+    const WorkerMessage = union(enum) {
+        NextTuple: []const u64,
+        Terminated,
+    };
+
+    const WorkerChannel = Channel(WorkerMessage, 1024);
+
+    fn queryWorker(
+        from: File,
+        arity: usize,
+        pattern: []const ?u64,
+        owner: *ConcurrentQueryIterator,
+    ) void {
+        defer from.close();
+        defer owner.channel.send(.Terminated);
+
+        var local = std.heap.GeneralPurposeAllocator(.{}).init;
+        const allocator = local.allocator();
+        defer {
+            const state = local.deinit();
+            if (state != .ok) {
+                panic("Leak detected in a BlockKDTree worker thread.\n", .{});
+            }
+        }
+
+        const buffer = allocator.alloc(u64, arity) catch |e| {
+            panic("BKD-tree buffer allocation failed, ran out of memory: {}\n", .{e});
+        };
+        defer allocator.free(buffer);
+
+        var streamer = kdf.QueryIterator{
+            .arity = arity,
+            .pattern = pattern,
+            .stack_allocator = allocator,
+            .source = StreamSource{ .file = from },
+        };
+        streamer.stack.append(allocator, .{ .at = 0, .depth = 0 }) catch |e| {
+            panic("BKD-tree stack allocation failed, ran out of memory: {}\n", .{e});
+        };
+        var it = streamer.iterator();
+        defer it.destroy();
+
+        while (it.next(buffer)) {
+            const shared = owner.shared.allocator();
+            const output = shared.alloc(u64, arity) catch |e| {
+                panic("BKD-tree buffer allocation failed, ran out of memory: {}\n", .{e});
+            };
+            @memcpy(output, buffer);
+            owner.channel.send(.{ .NextTuple = output });
+        }
+    }
+
+    const ConcurrentQueryIterator = struct {
+        allocator: Allocator,
+        /// Drains iterator of the staging area before consuming tuples from worker channel.
+        /// Afterwards, destroys the iterator and sets the field to `null`.
+        staging_iterator: ?TupleIterator,
+        /// Memory arena shared between workers, used to transfer data via the channel.
+        shared_arena: *ArenaAllocator,
+        shared: ThreadSafeAllocator,
+        channel: WorkerChannel = .{},
+        /// Number of workers connected to the output channel.
+        workers: usize,
+        fn init(
+            allocator: Allocator,
+            staging_iterator: TupleIterator,
+            workers: usize,
+        ) Allocator.Error!ConcurrentQueryIterator {
+            const arena = try allocator.create(ArenaAllocator);
+            arena.* = ArenaAllocator.init(allocator);
+            return .{
+                .allocator = allocator,
+                .shared_arena = arena,
+                .shared = ThreadSafeAllocator{ .child_allocator = arena.allocator() },
+                .staging_iterator = staging_iterator,
+                .workers = workers,
+            };
+        }
+        fn iterator(self: *ConcurrentQueryIterator) TupleIterator {
+            return TupleIterator{ .ptr = self, .destroyFn = destroy, .nextFn = next };
+        }
+        fn destroy(ptr: *anyopaque) void {
+            const self: *ConcurrentQueryIterator = @ptrCast(@alignCast(ptr));
+            if (self.staging_iterator) |s| s.destroy();
+            self.shared_arena.deinit();
+            self.allocator.destroy(self);
+        }
+        fn next(ptr: *anyopaque, into: []u64) bool {
+            errdefer unreachable; // TODO next() must return errors.
+            const self: *ConcurrentQueryIterator = @ptrCast(@alignCast(ptr));
+            if (self.staging_iterator) |it| {
+                if (it.next(into)) return true;
+                it.destroy();
+                self.staging_iterator = null;
+            }
+            while (0 < self.workers) {
+                switch (self.channel.recv()) {
+                    .Terminated => self.workers -|= 1,
+                    .NextTuple => |tuple| {
+                        const allocator = self.shared_arena.allocator();
+                        defer allocator.free(tuple);
+                        @memcpy(into, tuple);
+                        return true;
+                    },
+                }
+            }
+            return false;
+        }
+    };
+
+    fn query(
+        self: *BlockKDTree,
+        pattern: []const ?u64,
+        allocator: Allocator,
+        pool: *ThreadPool,
+    ) !TupleIterator {
+        var bit = self.buckets.iterate();
+        var sources: ArrayListUnmanaged(File) = .empty;
+        defer sources.deinit(allocator);
+        errdefer for (sources.items) |f| f.close();
+        files: while (try bit.next()) |*entry| {
+            if (entry.kind != .file) continue;
+            for (entry.name) |ch| {
+                if (!std.ascii.isDigit(ch)) continue :files;
+            }
+            try sources.append(
+                allocator,
+                try self.buckets.openFile(entry.name, .{}),
+            );
+        }
+
+        var it = try allocator.create(ConcurrentQueryIterator);
+        it.* = try ConcurrentQueryIterator.init(
+            allocator,
+            try self.staging.query(pattern, allocator),
+            sources.items.len,
+        );
+        errdefer allocator.destroy(it);
+        for (sources.items) |source| try pool.spawn(
+            queryWorker,
+            .{ source, self.arity, pattern, it },
+        );
+        return it.iterator();
+    }
+
     const BucketContext = struct {
         file: File,
         tree: *BlockKDTree,
@@ -1048,20 +1199,6 @@ const BlockKDTree = struct {
         const source = try from.pointers(local);
         try kdf.exportTree(self.arity, &into, source, local);
         try file.writeAll(into.items);
-    }
-    fn print(self: *BlockKDTree, allocator: Allocator) !void {
-        var arena = ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const local = arena.allocator();
-        std.debug.print("staging: {any}\n", .{self.staging.tuples.array.items});
-        for (0..10) |j| {
-            if (try self.importBucket(j, local)) |bucket| {
-                var temp = tuples.DirectCollection{ .arity = self.arity };
-                defer temp.deinit(local);
-                try temp.insertFromIterator(try bucket.iterator(), local);
-                std.debug.print("{d}: {any}\n", .{ j, temp.array.items });
-            }
-        }
     }
 };
 

@@ -10,7 +10,8 @@ const assert = std.debug.assert;
 const panic = std.debug.panic;
 
 /// Virtual table for data dispatching methods that matter.
-/// Method's argument lifetimes are limited to method call.
+/// Method's argument lifetimes are limited to method call:
+/// it's relevant for structs that require a buffer, like stack traces or strings.
 pub fn DispatchingMethods(comptime Context: type) type {
     return struct {
         onConstantString: *const fn (context: Context, obj: ConstantString) void,
@@ -21,6 +22,9 @@ pub fn DispatchingMethods(comptime Context: type) type {
         onInstanceDump: *const fn (context: Context, obj: InstanceDump) void,
         onObjectArrayDump: *const fn (context: Context, obj: ObjectArrayDump) void,
         onPrimitiveArrayDump: *const fn (context: Context, obj: PrimitiveArrayDump) void,
+        onRootThread: *const fn (context: Context, obj: RootThread) void,
+        onRootLocal: *const fn (context: Context, obj: RootLocal) void,
+        onRootReference: *const fn (context: Context, reference: u64) void,
     };
 }
 
@@ -54,103 +58,98 @@ pub fn Dispatcher(comptime Context: type) type {
         fn onPrimitiveArrayDump(self: Self, obj: PrimitiveArrayDump) void {
             return self.handlers.onPrimitiveArrayDump(self.context, obj);
         }
+        fn onRootThread(self: Self, obj: RootThread) void {
+            return self.handlers.onRootThread(self.context, obj);
+        }
+        fn onRootLocal(self: Self, obj: RootLocal) void {
+            return self.handlers.onRootLocal(self.context, obj);
+        }
+        fn onRootReference(self: Self, reference: u64) void {
+            return self.handlers.onRootReference(self.context, reference);
+        }
     };
 }
 
 /// Reader should be a GenericReader and dispatcher should be a Dispatcher struct.
 pub fn traverse(reader: anytype, dispatcher: anytype, allocator: Allocator) void {
+    // Panics on unexpected errors: any errors.
+    errdefer |e| panic("Heap parser's unexpected failure: {}\n", .{e});
+
     var buffer: [64]u8 = undefined;
-    const version = reader.readUntilDelimiter(&buffer, 0) catch |e|
-        panic("Heap parser's unexpected failure: {}\n", .{e});
+    const version = try reader.readUntilDelimiter(&buffer, 0);
     if (!std.mem.eql(u8, version, "JAVA PROFILE 1.0.2")) {
         panic("Unrecognized heap format and version '{s}'.\n", .{version});
     }
-    const id_size = reader.readInt(u32, .big) catch |e|
-        panic("Heap parser's unexpected failure: {}\n", .{e});
+    const id_size = try reader.readInt(u32, .big);
     if (id_size != 8) panic("Invalid id size: {}\n", .{id_size});
     // Ignores the heap timestamp:
     _ = reader.readInt(u64, .big) catch 0;
 
-    while (SegmentHeader.parseUnsafe(reader)) |segment| {
+    while (try SegmentHeader.parse(reader)) |segment| {
         switch (segment.tag) {
             .constant_string => {
-                const string = ConstantString.parseUnsafe(reader, segment, allocator);
+                const string = try ConstantString.parse(reader, segment, allocator);
                 defer string.destroy(allocator);
                 dispatcher.onConstantString(string);
             },
-            .load_class => dispatcher.onLoadClass(LoadClass.parseUnsafe(reader)),
-            .stack_frame => dispatcher.onStackFrame(StackFrame.parseUnsafe(reader)),
+            .load_class => dispatcher.onLoadClass(try LoadClass.parse(reader)),
+            .stack_frame => dispatcher.onStackFrame(try StackFrame.parse(reader)),
             .stack_trace => {
-                const trace = StackTrace.parseUnsafe(reader, allocator);
+                const trace = try StackTrace.parse(reader, allocator);
                 defer trace.destroy(allocator);
                 dispatcher.onStackTrace(trace);
             },
             .heap_dump, .heap_dump_segment => {
                 var stream = std.io.limitedReader(reader, segment.size);
                 const heap_reader = stream.reader();
-                while (RecordTag.parseUnsafe(heap_reader)) |t| switch (t) {
+                while (try RecordTag.parse(heap_reader)) |t| switch (t) {
                     .class_dump => {
-                        const dump = ClassDump.parseUnsafe(heap_reader, allocator);
+                        const dump = try ClassDump.parse(heap_reader, allocator);
                         defer dump.destroy(allocator);
                         dispatcher.onClassDump(dump);
                     },
                     .instance_dump => {
-                        const instance = InstanceDump.parseUnsafe(heap_reader, allocator);
+                        const instance = try InstanceDump.parse(heap_reader, allocator);
                         defer instance.destroy(allocator);
                         dispatcher.onInstanceDump(instance);
                     },
                     .object_array_dump => {
-                        const array = ObjectArrayDump.parseUnsafe(heap_reader, allocator);
+                        const array = try ObjectArrayDump.parse(heap_reader, allocator);
                         defer array.destroy(allocator);
                         dispatcher.onObjectArrayDump(array);
                     },
                     .primitive_array_dump => {
-                        const array = PrimitiveArrayDump.parseUnsafe(heap_reader, allocator);
+                        const array = try PrimitiveArrayDump.parse(heap_reader, allocator);
                         defer array.destroy(allocator);
                         dispatcher.onPrimitiveArrayDump(array);
                     },
-                    else => {
-                        std.debug.print("{any}\n", .{t});
-                        return;
+                    .root_thread_object => dispatcher.onRootThread(try RootThread.parse(heap_reader)),
+                    .root_java_frame => dispatcher.onRootLocal(try RootLocal.parse(heap_reader)),
+                    .root_jni_local => dispatcher.onRootLocal(try RootLocal.parse(heap_reader)),
+                    .root_jni_global => {
+                        const id = try heap_reader.readInt(u64, .big);
+                        const jni = try heap_reader.readInt(u64, .big);
+                        _ = jni;
+                        dispatcher.onRootReference(id);
+                    },
+                    .root_native_stack, .root_thread_block => {
+                        const id = try heap_reader.readInt(u64, .big);
+                        const thread_serial = try heap_reader.readInt(u32, .big);
+                        dispatcher.onRootLocal(.{ .id = id, .thread = thread_serial, .frame = null });
+                    },
+                    .root_sticky_class, .root_monitor_used => {
+                        dispatcher.onRootReference(try heap_reader.readInt(u64, .big));
                     },
                 };
             },
-            else => {
-                reader.skipBytes(segment.size, .{}) catch |e|
-                    panic("Heap parser's unexpected failure: {}\n", .{e});
-            },
+            else => try reader.skipBytes(segment.size, .{}),
         }
     }
 }
 
-/// Sample dispatcher context implementation.
-pub const NoopDispatcher = struct {
-    pub fn dispatcher() Dispatcher(void) {
-        return .{ .context = {}, .handlers = handlers };
-    }
-    fn onConstantString(_: void, _: ConstantString) void {}
-    fn onLoadClass(_: void, _: LoadClass) void {}
-    fn onStackFrame(_: void, _: StackFrame) void {}
-    fn onStackTrace(_: void, _: StackTrace) void {}
-    fn onClassDump(_: void, _: ClassDump) void {}
-    fn onInstanceDump(_: void, _: InstanceDump) void {}
-    fn onObjectArrayDump(_: void, _: ObjectArrayDump) void {}
-    fn onPrimitiveArrayDump(_: void, _: PrimitiveArrayDump) void {}
-    const handlers = DispatchingMethods(void){
-        .onConstantString = onConstantString,
-        .onLoadClass = onLoadClass,
-        .onStackFrame = onStackFrame,
-        .onStackTrace = onStackTrace,
-        .onClassDump = onClassDump,
-        .onInstanceDump = onInstanceDump,
-        .onObjectArrayDump = onObjectArrayDump,
-        .onPrimitiveArrayDump = onPrimitiveArrayDump,
-    };
-};
-
 /// Heap dump contains tagged segments.
 /// Important ones are strings, loaded classes, stack traces, and the heap itself.
-/// Parser will skip the rest.
+/// Parser skips the rest.
 const SegmentTag = enum(u8) {
     constant_string = 0x01,
     load_class = 0x02,
@@ -184,11 +183,6 @@ const SegmentHeader = struct {
         const size = try reader.readInt(u32, .big);
         return SegmentHeader{ .tag = tag, .time = time, .size = size };
     }
-    /// Panics on unexpected errors (any errors).
-    fn parseUnsafe(reader: anytype) ?SegmentHeader {
-        return parse(reader) catch |e|
-            panic("Heap parser's unexpected failure: {}\n", .{e});
-    }
 };
 
 const RecordTag = enum(u8) {
@@ -210,10 +204,6 @@ const RecordTag = enum(u8) {
             else => return e,
         };
     }
-    fn parseUnsafe(reader: anytype) ?RecordTag {
-        return parse(reader) catch |e|
-            panic("Heap parser's unexpected failure: {}\n", .{e});
-    }
 };
 
 /// A string from the JVM's string pool.
@@ -231,20 +221,14 @@ pub const ConstantString = struct {
     ) !ConstantString {
         const sid = try reader.readInt(u64, .big);
         const string = try allocator.alloc(u8, header.size -| 8);
-        _ = try reader.read(string);
+        try reader.readNoEof(string);
         return ConstantString{ .sid = sid, .string = string };
-    }
-    fn parseUnsafe(
-        reader: anytype,
-        header: SegmentHeader,
-        allocator: Allocator,
-    ) ConstantString {
-        return parse(reader, header, allocator) catch |e|
-            panic("Heap parser's unexpected failure: {}\n", .{e});
     }
 };
 
-const LoadClass = struct {
+/// Indicates a class that has been loaded by a class loader,
+/// assigns a name from the string pool to the class object.
+pub const LoadClass = struct {
     id: u64,
     name_sid: u64,
     fn parse(reader: anytype) !LoadClass {
@@ -256,41 +240,33 @@ const LoadClass = struct {
         _ = trace_serial;
         return LoadClass{ .id = id, .name_sid = name_sid };
     }
-    fn parseUnsafe(reader: anytype) LoadClass {
-        return parse(reader) catch |e|
-            panic("Heap parser's unexpected failure: {}\n", .{e});
-    }
 };
 
-const StackFrame = struct {
+pub const StackFrame = struct {
     frame_id: u64,
     method_sid: u64,
-    signature_sid: u64, // Points to a method signature string.
-    source_sid: u64, // Points to a source file name string.
-    line_number: u32,
+    signature_sid: u64,
+    source_sid: u64,
+    line_number: ?u32,
     fn parse(reader: anytype) !StackFrame {
         const frame_id = try reader.readInt(u64, .big);
         const method_sid = try reader.readInt(u64, .big);
         const signature_sid = try reader.readInt(u64, .big);
         const source_sid = try reader.readInt(u64, .big);
         const class_serial = try reader.readInt(u32, .big);
-        const line_number = try reader.readInt(u32, .big);
+        const line_number = try reader.readInt(i32, .big);
         _ = class_serial;
         return StackFrame{
             .frame_id = frame_id,
             .method_sid = method_sid,
             .signature_sid = signature_sid,
             .source_sid = source_sid,
-            .line_number = line_number,
+            .line_number = if (line_number < 0) null else @abs(line_number),
         };
-    }
-    fn parseUnsafe(reader: anytype) StackFrame {
-        return parse(reader) catch |e|
-            panic("Heap parser's unexpected failure: {}\n", .{e});
     }
 };
 
-const StackTrace = struct {
+pub const StackTrace = struct {
     thread: u32,
     frames: []const u64,
     fn destroy(self: StackTrace, allocator: Allocator) void {
@@ -308,13 +284,9 @@ const StackTrace = struct {
             .frames = frames,
         };
     }
-    fn parseUnsafe(reader: anytype, allocator: Allocator) StackTrace {
-        return parse(reader, allocator) catch |e|
-            panic("Heap parser's unexpected failure: {}\n", .{e});
-    }
 };
 
-const PrimitiveType = enum(u8) {
+pub const PrimitiveType = enum(u8) {
     reference = 2,
     boolean = 4,
     char,
@@ -326,7 +298,7 @@ const PrimitiveType = enum(u8) {
     long,
 };
 
-const PrimitiveValue = union(PrimitiveType) {
+pub const PrimitiveValue = union(PrimitiveType) {
     reference: u64,
     boolean: [1]u8,
     char: [2]u8,
@@ -338,9 +310,7 @@ const PrimitiveValue = union(PrimitiveType) {
     long: [8]u8,
     fn parseBytes(comptime size: usize, reader: anytype) ![size]u8 {
         var bytes: [size]u8 = undefined;
-        const count = try reader.read(&bytes);
-        if (count < size)
-            panic("Heap parser's unexpected failure: stream abruptly ended\n", .{});
+        try reader.readNoEof(&bytes);
         return bytes;
     }
     fn parse(t: PrimitiveType, reader: anytype) !PrimitiveValue {
@@ -356,13 +326,9 @@ const PrimitiveValue = union(PrimitiveType) {
             .long => .{ .long = try parseBytes(8, reader) },
         };
     }
-    fn parseUnsafe(t: PrimitiveType, reader: anytype) PrimitiveValue {
-        return parse(t, reader) catch |e|
-            panic("Heap parser's unexpected failure: {}\n", .{e});
-    }
 };
 
-const ClassDump = struct {
+pub const ClassDump = struct {
     const Static = struct { name_sid: u64, value: PrimitiveValue };
     const Field = struct { name_sid: u64, type: PrimitiveType };
     id: u64,
@@ -418,13 +384,9 @@ const ClassDump = struct {
             .fields = fields,
         };
     }
-    fn parseUnsafe(reader: anytype, allocator: Allocator) ClassDump {
-        return parse(reader, allocator) catch |e|
-            panic("Heap parser's unexpected failure: {}\n", .{e});
-    }
 };
 
-const InstanceDump = struct {
+pub const InstanceDump = struct {
     id: u64,
     class: u64,
     bytes: []const u8,
@@ -436,24 +398,20 @@ const InstanceDump = struct {
         const stack_serial = try reader.readInt(u32, .big);
         const class = try reader.readInt(u64, .big);
         const bytes_count = try reader.readInt(u32, .big);
-        const bytes = try allocator.alloc(u8, bytes_count);
-        const count = try reader.read(bytes);
-        if (count < bytes_count)
-            panic("Heap parser's unexpected failure: stream abruptly ended\n", .{});
+        try reader.skipBytes(bytes_count, .{});
+        //const bytes = try allocator.alloc(u8, bytes_count);
+        //try reader.readNoEof(bytes);
+        _ = allocator;
         _ = stack_serial;
         return InstanceDump{
             .id = id,
             .class = class,
-            .bytes = bytes,
+            .bytes = &[_]u8{},
         };
-    }
-    fn parseUnsafe(reader: anytype, allocator: Allocator) InstanceDump {
-        return parse(reader, allocator) catch |e|
-            panic("Heap parser's unexpected failure: {}\n", .{e});
     }
 };
 
-const ObjectArrayDump = struct {
+pub const ObjectArrayDump = struct {
     id: u64,
     class: u64,
     elements: []const u64,
@@ -465,22 +423,20 @@ const ObjectArrayDump = struct {
         const stack_serial = try reader.readInt(u32, .big);
         const elements_count = try reader.readInt(u32, .big);
         const class = try reader.readInt(u64, .big);
-        const elements = try allocator.alloc(u64, elements_count);
-        for (elements) |*element| element.* = try reader.readInt(u64, .big);
+        //const elements = try allocator.alloc(u64, elements_count);
+        //for (elements) |*element| element.* = try reader.readInt(u64, .big);
+        try reader.skipBytes(8 * elements_count, .{});
         _ = stack_serial;
+        _ = allocator;
         return ObjectArrayDump{
             .id = id,
             .class = class,
-            .elements = elements,
+            .elements = &[_]u64{},
         };
-    }
-    fn parseUnsafe(reader: anytype, allocator: Allocator) ObjectArrayDump {
-        return parse(reader, allocator) catch |e|
-            panic("Heap parser's unexpected failure: {}\n", .{e});
     }
 };
 
-const PrimitiveArrayDump = struct {
+pub const PrimitiveArrayDump = struct {
     id: u64,
     element: PrimitiveType,
     bytes: []const u8,
@@ -503,19 +459,51 @@ const PrimitiveArrayDump = struct {
             .int => 4,
             .long => 8,
         });
-        const bytes = try allocator.alloc(u8, s);
-        const count = try reader.read(bytes);
-        if (count < s)
-            panic("Heap parser's unexpected failure: stream abruptly ended\n", .{});
+        //const bytes = try allocator.alloc(u8, s);
+        //try reader.readNoEof(bytes);
+        try reader.skipBytes(s, .{});
         _ = stack_serial;
+        _ = allocator;
         return PrimitiveArrayDump{
             .id = id,
             .element = t,
-            .bytes = bytes,
+            .bytes = &[_]u8{},
         };
     }
-    fn parseUnsafe(reader: anytype, allocator: Allocator) PrimitiveArrayDump {
-        return parse(reader, allocator) catch |e|
-            panic("Heap parser's unexpected failure: {}\n", .{e});
+};
+
+/// A thread object for a running thread.
+pub const RootThread = struct {
+    id: u64,
+    thread: u32,
+    fn parse(reader: anytype) !RootThread {
+        const id = try reader.readInt(u64, .big);
+        const thread_serial = try reader.readInt(u32, .big);
+        const stack_serial = try reader.readInt(u32, .big);
+        _ = stack_serial;
+        return RootThread{
+            .id = id,
+            .thread = thread_serial,
+        };
+    }
+};
+
+// Shared between JNI local and regular local variable.
+// I don't think it matters much for heap analysis.
+pub const RootLocal = struct {
+    id: u64,
+    thread: u32,
+    /// Frame's index in thread's stack trace if available.
+    /// Shouldn't be confused with frame's id.
+    frame: ?u32,
+    fn parse(reader: anytype) !RootLocal {
+        const id = try reader.readInt(u64, .big);
+        const thread_serial = try reader.readInt(u32, .big);
+        const frame_number = try reader.readInt(i32, .big);
+        return RootLocal{
+            .id = id,
+            .thread = thread_serial,
+            .frame = if (frame_number < 0) null else @abs(frame_number),
+        };
     }
 };

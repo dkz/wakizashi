@@ -9,6 +9,60 @@ const LimitedReader = std.io.LimitedReader;
 const assert = std.debug.assert;
 const panic = std.debug.panic;
 
+/// Wrapper for StreamSource that supports both buffering and seek operations.
+/// Note that seek operations invalidate the reader and reset the buffer.
+pub const BufferedStreamSource = struct {
+    const StreamSource = std.io.StreamSource;
+    const SeekError = StreamSource.SeekError;
+    const GetSeekPosError = StreamSource.GetSeekPosError;
+    const BufferedReader = std.io.BufferedReader(4096, StreamSource.Reader);
+    const SeekableStream = std.io.SeekableStream(
+        *BufferedStreamSource,
+        SeekError,
+        GetSeekPosError,
+        seekTo,
+        seekBy,
+        getPos,
+        getEndPos,
+    );
+
+    buffered: BufferedReader,
+    source: *StreamSource,
+
+    fn init(source: *StreamSource) BufferedStreamSource {
+        return .{
+            .source = source,
+            .buffered = std.io.bufferedReader(source.reader()),
+        };
+    }
+    fn reader(self: *BufferedStreamSource) BufferedReader.Reader {
+        return self.buffered.reader();
+    }
+    fn seekableStream(self: *BufferedStreamSource) SeekableStream {
+        return .{ .context = self };
+    }
+
+    pub fn seekTo(self: *BufferedStreamSource, pos: u64) SeekError!void {
+        try self.source.seekTo(pos);
+        self.buffered = std.io.bufferedReader(self.source.reader());
+    }
+
+    pub fn seekBy(self: *BufferedStreamSource, amt: i64) SeekError!void {
+        try self.source.seekBy(amt);
+        self.buffered = std.io.bufferedReader(self.source.reader());
+    }
+
+    pub fn getEndPos(self: *BufferedStreamSource) GetSeekPosError!u64 {
+        return self.source.getEndPos();
+    }
+
+    pub fn getPos(self: *BufferedStreamSource) GetSeekPosError!u64 {
+        const pos = try self.source.getPos();
+        const lag = self.buffered.end - self.buffered.start;
+        return pos - lag;
+    }
+};
+
 /// Virtual table for data dispatching methods that matter.
 /// Method's argument lifetimes are limited to method call:
 /// it's relevant for structs that require a buffer, like stack traces or strings.
@@ -71,9 +125,11 @@ pub fn Dispatcher(comptime Context: type) type {
 }
 
 /// Reader should be a GenericReader and dispatcher should be a Dispatcher struct.
-pub fn traverse(reader: anytype, dispatcher: anytype, allocator: Allocator) void {
+pub fn traverse(source: *BufferedStreamSource, dispatcher: anytype, allocator: Allocator) void {
     // Panics on unexpected errors: any errors.
     errdefer |e| panic("Heap parser's unexpected failure: {}\n", .{e});
+    const seeker = source.seekableStream();
+    const reader = source.reader();
 
     var buffer: [64]u8 = undefined;
     const version = try reader.readUntilDelimiter(&buffer, 0);
@@ -109,18 +165,15 @@ pub fn traverse(reader: anytype, dispatcher: anytype, allocator: Allocator) void
                         dispatcher.onClassDump(dump);
                     },
                     .instance_dump => {
-                        const instance = try InstanceDump.parse(heap_reader, allocator);
-                        defer instance.destroy(allocator);
+                        const instance = try InstanceDump.parse(heap_reader, seeker);
                         dispatcher.onInstanceDump(instance);
                     },
                     .object_array_dump => {
-                        const array = try ObjectArrayDump.parse(heap_reader, allocator);
-                        defer array.destroy(allocator);
+                        const array = try ObjectArrayDump.parse(heap_reader, seeker);
                         dispatcher.onObjectArrayDump(array);
                     },
                     .primitive_array_dump => {
-                        const array = try PrimitiveArrayDump.parse(heap_reader, allocator);
-                        defer array.destroy(allocator);
+                        const array = try PrimitiveArrayDump.parse(heap_reader, seeker);
                         dispatcher.onPrimitiveArrayDump(array);
                     },
                     .root_thread_object => dispatcher.onRootThread(try RootThread.parse(heap_reader)),
@@ -386,27 +439,31 @@ pub const ClassDump = struct {
     }
 };
 
+const Seeker = BufferedStreamSource.SeekableStream;
+pub const BinaryBlob = struct {
+    pos: u64,
+    len: usize,
+};
+
 pub const InstanceDump = struct {
     id: u64,
     class: u64,
-    bytes: []const u8,
-    fn destroy(self: InstanceDump, allocator: Allocator) void {
-        allocator.free(self.bytes);
-    }
-    fn parse(reader: anytype, allocator: Allocator) !InstanceDump {
+    bytes: BinaryBlob,
+    fn parse(reader: anytype, seeker: Seeker) !InstanceDump {
         const id = try reader.readInt(u64, .big);
         const stack_serial = try reader.readInt(u32, .big);
         const class = try reader.readInt(u64, .big);
         const bytes_count = try reader.readInt(u32, .big);
+        const position = try seeker.getPos();
         try reader.skipBytes(bytes_count, .{});
-        //const bytes = try allocator.alloc(u8, bytes_count);
-        //try reader.readNoEof(bytes);
-        _ = allocator;
         _ = stack_serial;
         return InstanceDump{
             .id = id,
             .class = class,
-            .bytes = &[_]u8{},
+            .bytes = BinaryBlob{
+                .pos = position,
+                .len = bytes_count,
+            },
         };
     }
 };
@@ -414,41 +471,37 @@ pub const InstanceDump = struct {
 pub const ObjectArrayDump = struct {
     id: u64,
     class: u64,
-    elements: []const u64,
-    fn destroy(self: ObjectArrayDump, allocator: Allocator) void {
-        allocator.free(self.elements);
-    }
-    fn parse(reader: anytype, allocator: Allocator) !ObjectArrayDump {
+    bytes: BinaryBlob,
+    fn parse(reader: anytype, seeker: Seeker) !ObjectArrayDump {
         const id = try reader.readInt(u64, .big);
         const stack_serial = try reader.readInt(u32, .big);
         const elements_count = try reader.readInt(u32, .big);
         const class = try reader.readInt(u64, .big);
-        //const elements = try allocator.alloc(u64, elements_count);
-        //for (elements) |*element| element.* = try reader.readInt(u64, .big);
-        try reader.skipBytes(8 * elements_count, .{});
+        const bytes_count = 8 * elements_count;
+        const position = try seeker.getPos();
+        try reader.skipBytes(bytes_count, .{});
         _ = stack_serial;
-        _ = allocator;
         return ObjectArrayDump{
             .id = id,
             .class = class,
-            .elements = &[_]u64{},
+            .bytes = BinaryBlob{
+                .pos = position,
+                .len = bytes_count,
+            },
         };
     }
 };
 
 pub const PrimitiveArrayDump = struct {
     id: u64,
-    element: PrimitiveType,
-    bytes: []const u8,
-    fn destroy(self: PrimitiveArrayDump, allocator: Allocator) void {
-        allocator.free(self.bytes);
-    }
-    fn parse(reader: anytype, allocator: Allocator) !PrimitiveArrayDump {
+    element_type: PrimitiveType,
+    bytes: BinaryBlob,
+    fn parse(reader: anytype, seeker: Seeker) !PrimitiveArrayDump {
         const id = try reader.readInt(u64, .big);
         const stack_serial = try reader.readInt(u32, .big);
         const elements_count = try reader.readInt(u32, .big);
-        const t = try reader.readEnum(PrimitiveType, .big);
-        const s = elements_count * @as(usize, switch (t) {
+        const element_type = try reader.readEnum(PrimitiveType, .big);
+        const bytes_count = elements_count * @as(usize, switch (element_type) {
             .reference => 8,
             .boolean => 1,
             .char => 2,
@@ -459,15 +512,16 @@ pub const PrimitiveArrayDump = struct {
             .int => 4,
             .long => 8,
         });
-        //const bytes = try allocator.alloc(u8, s);
-        //try reader.readNoEof(bytes);
-        try reader.skipBytes(s, .{});
+        const position = try seeker.getPos();
+        try reader.skipBytes(bytes_count, .{});
         _ = stack_serial;
-        _ = allocator;
         return PrimitiveArrayDump{
             .id = id,
-            .element = t,
-            .bytes = &[_]u8{},
+            .element_type = element_type,
+            .bytes = BinaryBlob{
+                .pos = position,
+                .len = bytes_count,
+            },
         };
     }
 };
@@ -506,4 +560,34 @@ pub const RootLocal = struct {
             .frame = if (frame_number < 0) null else @abs(frame_number),
         };
     }
+};
+
+const NoopDispatcher = struct {
+    fn dispatcher() Dispatcher(void) {
+        return .{ .context = {}, .handlers = handlers };
+    }
+    fn onConstantString(_: void, _: ConstantString) void {}
+    fn onLoadClass(_: void, _: LoadClass) void {}
+    fn onStackFrame(_: void, _: StackFrame) void {}
+    fn onStackTrace(_: void, _: StackTrace) void {}
+    fn onClassDump(_: void, _: ClassDump) void {}
+    fn onInstanceDump(_: void, _: InstanceDump) void {}
+    fn onObjectArrayDump(_: void, _: ObjectArrayDump) void {}
+    fn onPrimitiveArrayDump(_: void, _: PrimitiveArrayDump) void {}
+    fn onRootThread(_: void, _: RootThread) void {}
+    fn onRootLocal(_: void, _: RootLocal) void {}
+    fn onRootReference(_: void, _: u64) void {}
+    const handlers = DispatchingMethods(void){
+        .onConstantString = onConstantString,
+        .onLoadClass = onLoadClass,
+        .onStackFrame = onStackFrame,
+        .onStackTrace = onStackTrace,
+        .onClassDump = onClassDump,
+        .onInstanceDump = onInstanceDump,
+        .onObjectArrayDump = onObjectArrayDump,
+        .onPrimitiveArrayDump = onPrimitiveArrayDump,
+        .onRootThread = onRootThread,
+        .onRootLocal = onRootLocal,
+        .onRootReference = onRootReference,
+    };
 };

@@ -9,60 +9,6 @@ const LimitedReader = std.io.LimitedReader;
 const assert = std.debug.assert;
 const panic = std.debug.panic;
 
-/// Wrapper for StreamSource that supports both buffering and seek operations.
-/// Note that seek operations invalidate the reader and reset the buffer.
-pub const BufferedStreamSource = struct {
-    const StreamSource = std.io.StreamSource;
-    const SeekError = StreamSource.SeekError;
-    const GetSeekPosError = StreamSource.GetSeekPosError;
-    const BufferedReader = std.io.BufferedReader(4096, StreamSource.Reader);
-    const SeekableStream = std.io.SeekableStream(
-        *BufferedStreamSource,
-        SeekError,
-        GetSeekPosError,
-        seekTo,
-        seekBy,
-        getPos,
-        getEndPos,
-    );
-
-    buffered: BufferedReader,
-    source: *StreamSource,
-
-    fn init(source: *StreamSource) BufferedStreamSource {
-        return .{
-            .source = source,
-            .buffered = std.io.bufferedReader(source.reader()),
-        };
-    }
-    fn reader(self: *BufferedStreamSource) BufferedReader.Reader {
-        return self.buffered.reader();
-    }
-    fn seekableStream(self: *BufferedStreamSource) SeekableStream {
-        return .{ .context = self };
-    }
-
-    pub fn seekTo(self: *BufferedStreamSource, pos: u64) SeekError!void {
-        try self.source.seekTo(pos);
-        self.buffered = std.io.bufferedReader(self.source.reader());
-    }
-
-    pub fn seekBy(self: *BufferedStreamSource, amt: i64) SeekError!void {
-        try self.source.seekBy(amt);
-        self.buffered = std.io.bufferedReader(self.source.reader());
-    }
-
-    pub fn getEndPos(self: *BufferedStreamSource) GetSeekPosError!u64 {
-        return self.source.getEndPos();
-    }
-
-    pub fn getPos(self: *BufferedStreamSource) GetSeekPosError!u64 {
-        const pos = try self.source.getPos();
-        const lag = self.buffered.end - self.buffered.start;
-        return pos - lag;
-    }
-};
-
 /// Virtual table for data dispatching methods that matter.
 /// Method's argument lifetimes are limited to method call:
 /// it's relevant for structs that require a buffer, like stack traces or strings.
@@ -124,12 +70,34 @@ pub fn Dispatcher(comptime Context: type) type {
     };
 }
 
-/// Reader should be a GenericReader and dispatcher should be a Dispatcher struct.
-pub fn traverse(source: *BufferedStreamSource, dispatcher: anytype, allocator: Allocator) void {
+/// Remembers byte position in an underlying reader.
+/// This hack is significatly faster for consecutive reads compared to using
+/// seekable stream and getPos() calls.
+fn PositionAwareReader(comptime ReaderType: type) type {
+    return struct {
+        backend: ReaderType,
+        position: usize = 0,
+        pub const Error = ReaderType.Error;
+        pub const Reader = std.io.Reader(*Self, Error, read);
+        pub fn read(self: *Self, dest: []u8) Error!usize {
+            const bytes_count = try self.backend.read(dest);
+            self.position += bytes_count;
+            return bytes_count;
+        }
+        pub fn reader(self: *Self) Reader {
+            return .{ .context = self };
+        }
+        const Self = @This();
+    };
+}
+
+/// Source should be a GenericReader and dispatcher should be a Dispatcher struct.
+pub fn traverse(source: anytype, dispatcher: anytype, allocator: Allocator) void {
     // Panics on unexpected errors: any errors.
     errdefer |e| panic("Heap parser's unexpected failure: {}\n", .{e});
-    const seeker = source.seekableStream();
-    const reader = source.reader();
+
+    var aware = PositionAwareReader(@TypeOf(source)){ .backend = source };
+    const reader = aware.reader();
 
     var buffer: [64]u8 = undefined;
     const version = try reader.readUntilDelimiter(&buffer, 0);
@@ -165,15 +133,15 @@ pub fn traverse(source: *BufferedStreamSource, dispatcher: anytype, allocator: A
                         dispatcher.onClassDump(dump);
                     },
                     .instance_dump => {
-                        const instance = try InstanceDump.parse(heap_reader, seeker);
+                        const instance = try InstanceDump.parse(heap_reader, aware);
                         dispatcher.onInstanceDump(instance);
                     },
                     .object_array_dump => {
-                        const array = try ObjectArrayDump.parse(heap_reader, seeker);
+                        const array = try ObjectArrayDump.parse(heap_reader, aware);
                         dispatcher.onObjectArrayDump(array);
                     },
                     .primitive_array_dump => {
-                        const array = try PrimitiveArrayDump.parse(heap_reader, seeker);
+                        const array = try PrimitiveArrayDump.parse(heap_reader, aware);
                         dispatcher.onPrimitiveArrayDump(array);
                     },
                     .root_thread_object => dispatcher.onRootThread(try RootThread.parse(heap_reader)),
@@ -439,7 +407,6 @@ pub const ClassDump = struct {
     }
 };
 
-const Seeker = BufferedStreamSource.SeekableStream;
 pub const BinaryBlob = struct {
     pos: u64,
     len: usize,
@@ -449,12 +416,12 @@ pub const InstanceDump = struct {
     id: u64,
     class: u64,
     bytes: BinaryBlob,
-    fn parse(reader: anytype, seeker: Seeker) !InstanceDump {
+    fn parse(reader: anytype, aware: anytype) !InstanceDump {
         const id = try reader.readInt(u64, .big);
         const stack_serial = try reader.readInt(u32, .big);
         const class = try reader.readInt(u64, .big);
         const bytes_count = try reader.readInt(u32, .big);
-        const position = try seeker.getPos();
+        const position = aware.position;
         try reader.skipBytes(bytes_count, .{});
         _ = stack_serial;
         return InstanceDump{
@@ -472,13 +439,13 @@ pub const ObjectArrayDump = struct {
     id: u64,
     class: u64,
     bytes: BinaryBlob,
-    fn parse(reader: anytype, seeker: Seeker) !ObjectArrayDump {
+    fn parse(reader: anytype, aware: anytype) !ObjectArrayDump {
         const id = try reader.readInt(u64, .big);
         const stack_serial = try reader.readInt(u32, .big);
         const elements_count = try reader.readInt(u32, .big);
         const class = try reader.readInt(u64, .big);
         const bytes_count = 8 * elements_count;
-        const position = try seeker.getPos();
+        const position = aware.position;
         try reader.skipBytes(bytes_count, .{});
         _ = stack_serial;
         return ObjectArrayDump{
@@ -496,7 +463,7 @@ pub const PrimitiveArrayDump = struct {
     id: u64,
     element_type: PrimitiveType,
     bytes: BinaryBlob,
-    fn parse(reader: anytype, seeker: Seeker) !PrimitiveArrayDump {
+    fn parse(reader: anytype, aware: anytype) !PrimitiveArrayDump {
         const id = try reader.readInt(u64, .big);
         const stack_serial = try reader.readInt(u32, .big);
         const elements_count = try reader.readInt(u32, .big);
@@ -512,7 +479,7 @@ pub const PrimitiveArrayDump = struct {
             .int => 4,
             .long => 8,
         });
-        const position = try seeker.getPos();
+        const position = aware.position;
         try reader.skipBytes(bytes_count, .{});
         _ = stack_serial;
         return PrimitiveArrayDump{

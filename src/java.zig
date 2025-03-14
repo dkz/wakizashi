@@ -4,7 +4,11 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const ArenaAllocator = std.heap.ArenaAllocator;
 const LimitedReader = std.io.LimitedReader;
+const HashMap = std.AutoHashMapUnmanaged;
+const SegmentedList = std.SegmentedList;
+const File = std.fs.File;
 
 const assert = std.debug.assert;
 const panic = std.debug.panic;
@@ -12,61 +16,20 @@ const panic = std.debug.panic;
 /// Virtual table for data dispatching methods that matter.
 /// Method's argument lifetimes are limited to method call:
 /// it's relevant for structs that require a buffer, like stack traces or strings.
-pub fn DispatchingMethods(comptime Context: type) type {
+pub fn HandlerMethods(comptime Context: type, comptime Error: type) type {
     return struct {
-        onConstantString: *const fn (context: Context, obj: ConstantString) void,
-        onLoadClass: *const fn (context: Context, obj: LoadClass) void,
-        onStackFrame: *const fn (context: Context, obj: StackFrame) void,
-        onStackTrace: *const fn (context: Context, obj: StackTrace) void,
-        onClassDump: *const fn (context: Context, obj: ClassDump) void,
-        onInstanceDump: *const fn (context: Context, obj: InstanceDump) void,
-        onObjectArrayDump: *const fn (context: Context, obj: ObjectArrayDump) void,
-        onPrimitiveArrayDump: *const fn (context: Context, obj: PrimitiveArrayDump) void,
-        onRootThread: *const fn (context: Context, obj: RootThread) void,
-        onRootLocal: *const fn (context: Context, obj: RootLocal) void,
-        onRootReference: *const fn (context: Context, reference: u64) void,
-    };
-}
-
-/// Couples dispatching context with virtual table for convenience.
-pub fn Dispatcher(comptime Context: type) type {
-    return struct {
-        context: Context,
-        handlers: DispatchingMethods(Context),
-        const Self = @This();
-        fn onConstantString(self: Self, obj: ConstantString) void {
-            return self.handlers.onConstantString(self.context, obj);
-        }
-        fn onLoadClass(self: Self, obj: LoadClass) void {
-            return self.handlers.onLoadClass(self.context, obj);
-        }
-        fn onStackFrame(self: Self, obj: StackFrame) void {
-            return self.handlers.onStackFrame(self.context, obj);
-        }
-        fn onStackTrace(self: Self, obj: StackTrace) void {
-            return self.handlers.onStackTrace(self.context, obj);
-        }
-        fn onClassDump(self: Self, obj: ClassDump) void {
-            return self.handlers.onClassDump(self.context, obj);
-        }
-        fn onInstanceDump(self: Self, obj: InstanceDump) void {
-            return self.handlers.onInstanceDump(self.context, obj);
-        }
-        fn onObjectArrayDump(self: Self, obj: ObjectArrayDump) void {
-            return self.handlers.onObjectArrayDump(self.context, obj);
-        }
-        fn onPrimitiveArrayDump(self: Self, obj: PrimitiveArrayDump) void {
-            return self.handlers.onPrimitiveArrayDump(self.context, obj);
-        }
-        fn onRootThread(self: Self, obj: RootThread) void {
-            return self.handlers.onRootThread(self.context, obj);
-        }
-        fn onRootLocal(self: Self, obj: RootLocal) void {
-            return self.handlers.onRootLocal(self.context, obj);
-        }
-        fn onRootReference(self: Self, reference: u64) void {
-            return self.handlers.onRootReference(self.context, reference);
-        }
+        onHeapTimestamp: ?*const fn (context: Context, ts: u64) Error!void = null,
+        onConstantString: ?*const fn (context: Context, obj: ConstantString) Error!void = null,
+        onLoadClass: ?*const fn (context: Context, obj: LoadClass) Error!void = null,
+        onStackFrame: ?*const fn (context: Context, obj: StackFrame) Error!void = null,
+        onStackTrace: ?*const fn (context: Context, obj: StackTrace) Error!void = null,
+        onClassDump: ?*const fn (context: Context, obj: ClassDump) Error!void = null,
+        onInstanceDump: ?*const fn (context: Context, obj: InstanceDump) Error!void = null,
+        onObjectArrayDump: ?*const fn (context: Context, obj: ObjectArrayDump) Error!void = null,
+        onPrimitiveArrayDump: ?*const fn (context: Context, obj: PrimitiveArrayDump) Error!void = null,
+        onRootThread: ?*const fn (context: Context, obj: RootThread) Error!void = null,
+        onRootLocal: ?*const fn (context: Context, obj: RootLocal) Error!void = null,
+        onRootReference: ?*const fn (context: Context, reference: u64) Error!void = null,
     };
 }
 
@@ -91,12 +54,16 @@ fn PositionAwareReader(comptime ReaderType: type) type {
     };
 }
 
-/// Source should be a GenericReader and dispatcher should be a Dispatcher struct.
-pub fn traverse(source: anytype, dispatcher: anytype, allocator: Allocator) void {
-    // Panics on unexpected errors: any errors.
-    errdefer |e| panic("Heap parser's unexpected failure: {}\n", .{e});
-
-    var aware = PositionAwareReader(@TypeOf(source)){ .backend = source };
+pub fn genericScan(
+    comptime Context: type,
+    comptime Error: type,
+    comptime Reader: type,
+    source: Reader,
+    context: Context,
+    methods: HandlerMethods(Context, Error),
+    allocator: Allocator,
+) !void {
+    var aware = PositionAwareReader(Reader){ .backend = source };
     const reader = aware.reader();
 
     var buffer: [64]u8 = undefined;
@@ -104,68 +71,118 @@ pub fn traverse(source: anytype, dispatcher: anytype, allocator: Allocator) void
     if (!std.mem.eql(u8, version, "JAVA PROFILE 1.0.2")) {
         panic("Unrecognized heap format and version '{s}'.\n", .{version});
     }
+
     const id_size = try reader.readInt(u32, .big);
     if (id_size != 8) panic("Invalid id size: {}\n", .{id_size});
-    // Ignores the heap timestamp:
-    _ = reader.readInt(u64, .big) catch 0;
 
-    while (try SegmentHeader.parse(reader)) |segment| {
-        switch (segment.tag) {
-            .constant_string => {
-                const string = try ConstantString.parse(reader, segment, allocator);
-                defer string.destroy(allocator);
-                dispatcher.onConstantString(string);
-            },
-            .load_class => dispatcher.onLoadClass(try LoadClass.parse(reader)),
-            .stack_frame => dispatcher.onStackFrame(try StackFrame.parse(reader)),
-            .stack_trace => {
-                const trace = try StackTrace.parse(reader, allocator);
-                defer trace.destroy(allocator);
-                dispatcher.onStackTrace(trace);
-            },
-            .heap_dump, .heap_dump_segment => {
-                var stream = std.io.limitedReader(reader, segment.size);
-                const heap_reader = stream.reader();
-                while (try RecordTag.parse(heap_reader)) |t| switch (t) {
-                    .class_dump => {
-                        const dump = try ClassDump.parse(heap_reader, allocator);
-                        defer dump.destroy(allocator);
-                        dispatcher.onClassDump(dump);
-                    },
-                    .instance_dump => {
-                        const instance = try InstanceDump.parse(heap_reader, aware);
-                        dispatcher.onInstanceDump(instance);
-                    },
-                    .object_array_dump => {
-                        const array = try ObjectArrayDump.parse(heap_reader, aware);
-                        dispatcher.onObjectArrayDump(array);
-                    },
-                    .primitive_array_dump => {
-                        const array = try PrimitiveArrayDump.parse(heap_reader, aware);
-                        dispatcher.onPrimitiveArrayDump(array);
-                    },
-                    .root_thread_object => dispatcher.onRootThread(try RootThread.parse(heap_reader)),
-                    .root_java_frame => dispatcher.onRootLocal(try RootLocal.parse(heap_reader)),
-                    .root_jni_local => dispatcher.onRootLocal(try RootLocal.parse(heap_reader)),
-                    .root_jni_global => {
-                        const id = try heap_reader.readInt(u64, .big);
-                        const jni = try heap_reader.readInt(u64, .big);
-                        _ = jni;
-                        dispatcher.onRootReference(id);
-                    },
-                    .root_native_stack, .root_thread_block => {
-                        const id = try heap_reader.readInt(u64, .big);
-                        const thread_serial = try heap_reader.readInt(u32, .big);
-                        dispatcher.onRootLocal(.{ .id = id, .thread = thread_serial, .frame = null });
-                    },
-                    .root_sticky_class, .root_monitor_used => {
-                        dispatcher.onRootReference(try heap_reader.readInt(u64, .big));
-                    },
-                };
-            },
-            else => try reader.skipBytes(segment.size, .{}),
-        }
-    }
+    const ts = try reader.readInt(u64, .big);
+    if (methods.onHeapTimestamp) |func| try func(context, ts);
+
+    while (try SegmentHeader.parse(reader)) |segment| switch (segment.tag) {
+        .constant_string => {
+            if (methods.onConstantString) |func| {
+                const obj = try ConstantString.parse(reader, segment, allocator);
+                defer obj.destroy(allocator);
+                try func(context, obj);
+            } else {
+                try reader.skipBytes(segment.size, .{});
+            }
+        },
+        .load_class => {
+            if (methods.onLoadClass) |func| {
+                try func(context, try LoadClass.parse(reader));
+            } else {
+                try reader.skipBytes(segment.size, .{});
+            }
+        },
+        .stack_frame => {
+            if (methods.onStackTrace) |func| {
+                const obj = try StackTrace.parse(reader, allocator);
+                defer obj.destroy(allocator);
+                try func(context, obj);
+            } else {
+                try reader.skipBytes(segment.size, .{});
+            }
+        },
+        .stack_trace => {
+            if (methods.onStackTrace) |func| {
+                const obj = try StackTrace.parse(reader, allocator);
+                defer obj.destroy(allocator);
+                try func(context, obj);
+            } else {
+                try reader.skipBytes(segment.size, .{});
+            }
+        },
+        .heap_dump, .heap_dump_segment => {
+            var stream = std.io.limitedReader(reader, segment.size);
+            const heap = stream.reader();
+            while (try RecordTag.parse(heap)) |tag| switch (tag) {
+                .class_dump => {
+                    const obj = try ClassDump.parse(heap, allocator);
+                    defer obj.destroy(allocator);
+                    if (methods.onClassDump) |func| {
+                        try func(context, obj);
+                    }
+                },
+                .instance_dump => {
+                    const obj = try InstanceDump.parse(heap, aware);
+                    if (methods.onInstanceDump) |func| {
+                        try func(context, obj);
+                    }
+                },
+                .object_array_dump => {
+                    const obj = try ObjectArrayDump.parse(heap, aware);
+                    if (methods.onObjectArrayDump) |func| {
+                        try func(context, obj);
+                    }
+                },
+                .primitive_array_dump => {
+                    const obj = try PrimitiveArrayDump.parse(heap, aware);
+                    if (methods.onPrimitiveArrayDump) |func| {
+                        try func(context, obj);
+                    }
+                },
+                .root_thread_object => {
+                    const obj = try RootThread.parse(heap);
+                    if (methods.onRootThread) |func| {
+                        try func(context, obj);
+                    }
+                },
+                .root_java_frame, .root_jni_local => {
+                    const obj = try RootLocal.parse(heap);
+                    if (methods.onRootLocal) |func| {
+                        try func(context, obj);
+                    }
+                },
+                .root_jni_global => {
+                    const id = try heap.readInt(u64, .big);
+                    const jni = try heap.readInt(u64, .big);
+                    _ = jni;
+                    if (methods.onRootReference) |func| {
+                        try func(context, id);
+                    }
+                },
+                .root_native_stack, .root_thread_block => {
+                    const id = try heap.readInt(u64, .big);
+                    const thread_serial = try heap.readInt(u32, .big);
+                    if (methods.onRootLocal) |func| {
+                        try func(context, .{
+                            .id = id,
+                            .thread = thread_serial,
+                            .frame = null,
+                        });
+                    }
+                },
+                .root_sticky_class, .root_monitor_used => {
+                    const id = try heap.readInt(u64, .big);
+                    if (methods.onRootReference) |func| {
+                        try func(context, id);
+                    }
+                },
+            };
+        },
+        else => try reader.skipBytes(segment.size, .{}),
+    };
 }
 
 /// Heap dump contains tagged segments.
@@ -350,8 +367,8 @@ pub const PrimitiveValue = union(PrimitiveType) {
 };
 
 pub const ClassDump = struct {
-    const Static = struct { name_sid: u64, value: PrimitiveValue };
-    const Field = struct { name_sid: u64, type: PrimitiveType };
+    const Field = struct { name: u64, type: PrimitiveType };
+    const Static = struct { name: u64, value: PrimitiveValue };
     id: u64,
     super: u64,
     instance_size: u32,
@@ -379,18 +396,18 @@ pub const ClassDump = struct {
             _ = try PrimitiveValue.parse(t, reader);
         }
         const statics_count = try reader.readInt(u16, .big);
-        const statics = try allocator.alloc(ClassDump.Static, statics_count);
+        const statics = try allocator.alloc(Static, statics_count);
         errdefer allocator.free(statics);
         for (statics) |*static| {
-            static.name_sid = try reader.readInt(u64, .big);
+            static.name = try reader.readInt(u64, .big);
             const t = try reader.readEnum(PrimitiveType, .big);
             static.value = try PrimitiveValue.parse(t, reader);
         }
         const fields_count = try reader.readInt(u16, .big);
-        const fields = try allocator.alloc(ClassDump.Field, fields_count);
+        const fields = try allocator.alloc(Field, fields_count);
         errdefer allocator.free(fields);
         for (fields) |*field| {
-            field.name_sid = try reader.readInt(u64, .big);
+            field.name = try reader.readInt(u64, .big);
             field.type = try reader.readEnum(PrimitiveType, .big);
         }
         _ = loader;
@@ -410,6 +427,18 @@ pub const ClassDump = struct {
 pub const BinaryBlob = struct {
     pos: u64,
     len: usize,
+    fn extract(self: BinaryBlob, from: File, allocator: Allocator) ![]u8 {
+        const buf = try allocator.alloc(u8, self.len);
+        const pos = try from.getPos();
+        defer from.seekTo(pos) catch |e| {
+            panic("Unable to revert seek position for file {any}: {}\n", .{ from, e });
+        };
+        try from.seekTo(self.pos);
+        if (self.len != try from.read(buf)) {
+            panic("Unable to extract binary blob from file {any}\n", .{from});
+        }
+        return buf;
+    }
 };
 
 pub const InstanceDump = struct {
@@ -529,32 +558,98 @@ pub const RootLocal = struct {
     }
 };
 
-const NoopDispatcher = struct {
-    fn dispatcher() Dispatcher(void) {
-        return .{ .context = {}, .handlers = handlers };
-    }
-    fn onConstantString(_: void, _: ConstantString) void {}
-    fn onLoadClass(_: void, _: LoadClass) void {}
-    fn onStackFrame(_: void, _: StackFrame) void {}
-    fn onStackTrace(_: void, _: StackTrace) void {}
-    fn onClassDump(_: void, _: ClassDump) void {}
-    fn onInstanceDump(_: void, _: InstanceDump) void {}
-    fn onObjectArrayDump(_: void, _: ObjectArrayDump) void {}
-    fn onPrimitiveArrayDump(_: void, _: PrimitiveArrayDump) void {}
-    fn onRootThread(_: void, _: RootThread) void {}
-    fn onRootLocal(_: void, _: RootLocal) void {}
-    fn onRootReference(_: void, _: u64) void {}
-    const handlers = DispatchingMethods(void){
-        .onConstantString = onConstantString,
-        .onLoadClass = onLoadClass,
-        .onStackFrame = onStackFrame,
-        .onStackTrace = onStackTrace,
-        .onClassDump = onClassDump,
-        .onInstanceDump = onInstanceDump,
-        .onObjectArrayDump = onObjectArrayDump,
-        .onPrimitiveArrayDump = onPrimitiveArrayDump,
-        .onRootThread = onRootThread,
-        .onRootLocal = onRootLocal,
-        .onRootReference = onRootReference,
+pub const FieldValue = struct {
+    name: ?[]const u8,
+    value: PrimitiveValue,
+};
+
+pub const ClassRegistry = struct {
+    pub const ScanError = Allocator.Error;
+
+    const Class = struct {
+        name: u64,
+        superclass: u64 = 0,
+        fields_offset: usize = 0,
+        fields_size: usize = 0,
     };
+
+    arena: ArenaAllocator,
+    strings: HashMap(u64, []const u8) = .empty,
+    classes: HashMap(u64, Class) = .empty,
+    fields: SegmentedList(ClassDump.Field, 0) = .{},
+
+    pub const FieldIterator = struct {
+        allocator: Allocator,
+        registry: *ClassRegistry,
+        owned_buffer: []const u8,
+        stream: std.io.FixedBufferStream([]u8),
+        current_class: u64,
+        current_field: u64 = 0,
+        pub fn destroy(self: *FieldIterator) void {
+            self.allocator.free(self.owned_buffer);
+        }
+        pub fn next(self: *FieldIterator) !?FieldValue {
+            while (self.registry.classes.get(self.current_class)) |class| {
+                if (self.current_field < class.fields_size) {
+                    const index = class.fields_offset + self.current_field;
+                    const field = self.registry.fields.at(index);
+                    const value: FieldValue = .{
+                        .name = self.registry.strings.get(field.name),
+                        .value = try PrimitiveValue.parse(field.type, self.stream.reader()),
+                    };
+                    self.current_field += 1;
+                    return value;
+                } else {
+                    if (self.current_class == 0) return null;
+                    self.current_class = class.superclass;
+                    self.current_field = 0;
+                }
+            } else {
+                return null;
+            }
+        }
+    };
+
+    pub fn parseInstance(
+        self: *ClassRegistry,
+        from: File,
+        object: InstanceDump,
+        allocator: Allocator,
+    ) !FieldIterator {
+        const owned_buffer = try object.bytes.extract(from, allocator);
+        errdefer allocator.free(owned_buffer);
+        return FieldIterator{
+            .allocator = allocator,
+            .owned_buffer = owned_buffer,
+            .registry = self,
+            .stream = std.io.fixedBufferStream(owned_buffer),
+            .current_class = object.class,
+        };
+    }
+
+    fn destroy(self: *ClassRegistry) void {
+        self.arena.deinit();
+    }
+
+    pub fn onConstantString(self: *ClassRegistry, constant: ConstantString) ScanError!void {
+        const allocator = self.arena.allocator();
+        const owned = try allocator.dupe(u8, constant.string);
+        try self.strings.put(allocator, constant.sid, owned);
+    }
+    pub fn onLoadClass(self: *ClassRegistry, class: LoadClass) ScanError!void {
+        const allocator = self.arena.allocator();
+        try self.classes.put(allocator, class.id, Class{
+            .name = class.name_sid,
+        });
+    }
+    pub fn onClassDump(self: *ClassRegistry, class: ClassDump) ScanError!void {
+        const allocator = self.arena.allocator();
+        const fields_index = self.fields.len;
+        try self.fields.appendSlice(allocator, class.fields);
+        if (self.classes.getPtr(class.id)) |ptr| {
+            ptr.superclass = class.super;
+            ptr.fields_size = class.fields.len;
+            ptr.fields_offset = fields_index;
+        }
+    }
 };

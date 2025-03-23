@@ -1,33 +1,38 @@
 const std = @import("std");
+
 const lang = @import("lang.zig");
 const database = @import("database.zig");
 const engine = @import("engine.zig");
+
 const ArenaAllocator = std.heap.ArenaAllocator;
+const ArrayListUnmanaged = std.ArrayListUnmanaged;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    // Arena for sorce code related objects, like syntax tree.
-    var source_arena = ArenaAllocator.init(gpa.allocator());
-    defer source_arena.deinit();
-
-    var database_arena = ArenaAllocator.init(gpa.allocator());
-    defer database_arena.deinit();
-
     const stdout_handle = std.io.getStdOut();
     var stdout_buffered = std.io.bufferedWriter(stdout_handle.writer());
     const stdout = stdout_buffered.writer();
 
-    var evaluator = engine.Evaluator.create(database_arena.allocator());
+    var domain = database.Domain{};
+    var domain_arena = ArenaAllocator.init(gpa.allocator());
+    defer domain_arena.deinit();
+
+    var source_arena = ArenaAllocator.init(gpa.allocator());
+    defer source_arena.deinit();
+
+    var stratum: ArrayListUnmanaged(engine.RuleEvaluator) = .empty;
+    defer stratum.deinit(gpa.allocator());
+    defer {
+        for (stratum.items) |*rule| rule.deinit(gpa.allocator());
+    }
 
     const cwd = std.fs.cwd();
     var args = try std.process.argsWithAllocator(gpa.allocator());
     defer args.deinit();
     _ = args.skip();
     while (args.next()) |a| {
-        var local = ArenaAllocator.init(gpa.allocator());
-        defer local.deinit();
         var source_file = try cwd.openFile(a, .{});
         defer source_file.close();
         const source = source: {
@@ -36,14 +41,21 @@ pub fn main() !void {
             break :source try rdr.readAllAlloc(source_arena.allocator(), 1024 * 8);
         };
         const file = try lang.ast.parse(a, source, &source_arena);
-        try evaluator.read(&file, database_arena.allocator());
+        for (file.statements) |*rule| {
+            try stratum.append(
+                gpa.allocator(),
+                try engine.RuleEvaluator.init(
+                    rule,
+                    &domain,
+                    domain_arena.allocator(),
+                    gpa.allocator(),
+                ),
+            );
+        }
     }
 
-    while (try evaluator.iterate(&database_arena)) {}
-    {
-        var local = ArenaAllocator.init(gpa.allocator());
-        defer local.deinit();
-        try evaluator.printDb(local.allocator(), stdout.any());
+    for (stratum.items) |eval| {
+        try pretty_print(eval, stdout);
     }
 
     try stdout_buffered.flush();

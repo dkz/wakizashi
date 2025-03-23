@@ -2,6 +2,9 @@ const std = @import("std");
 const lang = @import("lang.zig");
 const database = @import("database.zig");
 
+const panic = std.debug.panic;
+const assert = std.debug.assert;
+
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
@@ -38,242 +41,158 @@ fn Queue(comptime T: type) type {
     };
 }
 
-const Bindings = std.StringHashMapUnmanaged(u64);
-
-/// Atom, rewritten with relation information and tuple structure.
-const DomainTuple = struct {
-    const DomainTerm = union(enum) {
-        wildcard,
-        variable: []const u8,
-        constant: u64,
+pub const RuleEvaluator = struct {
+    const Name = []const u8;
+    const Bindings = std.StringHashMapUnmanaged(u64);
+    const EncodedAtom = struct {
+        source: *const lang.ast.Atom,
+        encoded: []const Term,
+        relation: database.Relation,
+        const Term = union(enum) {
+            wildcard,
+            variable: Name,
+            constant: u64,
+        };
+        /// Rewrite a regular ast.Atom into a domain encoded atom.
+        fn init(
+            atom: *const lang.ast.Atom,
+            domain: *database.Domain,
+            domain_allocator: Allocator,
+            allocator: Allocator,
+        ) Allocator.Error!EncodedAtom {
+            const relation = database.Relation{
+                .name = atom.predicate,
+                .arity = atom.terms.len,
+            };
+            const tuple = try allocator.alloc(Term, relation.arity);
+            for (atom.terms, 0..) |term, j| {
+                tuple[j] = switch (term) {
+                    .wildcard => .wildcard,
+                    .variable => |name| Term{ .variable = name },
+                    .literal => |value| Term{
+                        .constant = try domain.register(
+                            domain_allocator,
+                            database.DomainValue{ .binary = value },
+                        ),
+                    },
+                };
+            }
+            return EncodedAtom{
+                .source = atom,
+                .encoded = tuple,
+                .relation = relation,
+            };
+        }
+        fn deinit(self: *const EncodedAtom, allocator: Allocator) void {
+            allocator.free(self.encoded);
+        }
+        /// Given currently bound variables, transform the atom into a query.
+        fn toQuery(self: *const EncodedAtom, bindings: *Bindings, into: []?u64) void {
+            assert(self.relation.arity == into.len);
+            for (into, 0..) |*q, j| {
+                switch (self.encoded[j]) {
+                    .wildcard => q.* = null,
+                    .constant => |encoded| q.* = encoded,
+                    .variable => |variable| q.* = bindings.get(variable),
+                }
+            }
+        }
+        /// Given a set of bound variables, transform the atom into a tuple.
+        fn toTuple(self: *const EncodedAtom, bindings: *Bindings, into: []u64) void {
+            assert(self.relation.arity == into.len);
+            for (into, 0..) |*t, j| {
+                t.* = switch (self.encoded[j]) {
+                    .wildcard => unreachable,
+                    .constant => |encoded| encoded,
+                    .variable => |name| bindings.get(name).?,
+                };
+            }
+        }
+        /// Given a query result, produce a new copy of bindings with
+        /// variable from the tuple bound to their correspoding names.
+        fn unify(
+            self: *const EncodedAtom,
+            tuple: []const u64,
+            bindings: *Bindings,
+            allocator: Allocator,
+        ) Allocator.Error!*Bindings {
+            assert(tuple.len == self.relation.arity);
+            const copy = try allocator.create(Bindings);
+            copy.* = try bindings.clone(allocator);
+            for (self.encoded, tuple) |e, t| {
+                switch (e) {
+                    .wildcard => {},
+                    .constant => {},
+                    .variable => |name| {
+                        if (!bindings.contains(name)) {
+                            try copy.put(allocator, name, t);
+                        }
+                    },
+                }
+            }
+            return copy;
+        }
     };
-    relation: database.Relation,
-    encoded: []const DomainTerm,
-    source: *const lang.ast.Atom,
-    fn init(
-        atom: *const lang.ast.Atom,
-        domain: *database.Domain,
-        allocator: Allocator,
-    ) Allocator.Error!DomainTuple {
-        const target_relation = database.Relation{
-            .name = atom.predicate,
-            .arity = atom.terms.len,
-        };
-        const tuple = try allocator.alloc(DomainTerm, target_relation.arity);
-        errdefer allocator.free(tuple);
-        for (atom.terms, 0..) |term, j| {
-            switch (term) {
-                .wildcard => {
-                    tuple[j] = .wildcard;
-                },
-                .variable => |name| {
-                    tuple[j] = DomainTerm{ .variable = name };
-                },
-                .literal => |value| {
-                    tuple[j] = DomainTerm{
-                        // TODO Do something about rewriter using the same allocator for rewrites
-                        // and pushing values to the underlying domain.
-                        .constant = try domain.register(allocator, database.DomainValue{ .binary = value }),
-                    };
-                },
-            }
-        }
-        return DomainTuple{
-            .relation = target_relation,
-            .encoded = tuple,
-            .source = atom,
-        };
-    }
-    fn initQuery(
-        self: *const DomainTuple,
-        bindings: *Bindings,
-        query: []?u64,
-    ) void {
-        std.debug.assert(self.relation.arity == query.len);
-        for (query, 0..) |*q, j| {
-            switch (self.encoded[j]) {
-                .wildcard => {
-                    q.* = null;
-                },
-                .variable => |variable| {
-                    q.* = bindings.get(variable);
-                },
-                .constant => |encoded| {
-                    q.* = encoded;
-                },
-            }
-        }
-    }
-    fn initTuple(
-        self: *const DomainTuple,
-        bindings: *Bindings,
-        into: []u64,
-    ) void {
-        std.debug.assert(self.relation.arity == into.len);
-        for (into, 0..) |*t, j| {
-            switch (self.encoded[j]) {
-                .wildcard => unreachable,
-                .variable => |variable| t.* = bindings.get(variable).?,
-                .constant => |encoded| t.* = encoded,
-            }
-        }
-    }
-    fn unify(
-        self: *const DomainTuple,
-        tuple: []const u64,
-        bindings: *Bindings,
-        allocator: Allocator,
-    ) Allocator.Error!*Bindings {
-        std.debug.assert(self.relation.arity == tuple.len);
-        const result = try allocator.create(Bindings);
-        errdefer allocator.destroy(result);
-        result.* = try bindings.clone(allocator);
-        errdefer result.deinit(allocator);
-        for (self.encoded, tuple) |e, t| {
-            switch (e) {
-                .wildcard => {},
-                .constant => {},
-                .variable => |variable| {
-                    if (!bindings.contains(variable)) {
-                        try result.put(allocator, variable, t);
-                    }
-                },
-            }
-        }
-        return result;
-    }
-};
-
-const DomainRule = struct {
-    head: DomainTuple,
-    body: []const DomainTuple,
     source: *const lang.ast.Rule,
-    fn init(rule: *const lang.ast.Rule, domain: *database.Domain, allocator: Allocator) Allocator.Error!DomainRule {
-        const rule_head = try DomainTuple.init(&rule.head, domain, allocator);
-        const rule_body = try allocator.alloc(DomainTuple, rule.body.len);
-        errdefer allocator.free(rule_body);
+    head: EncodedAtom,
+    body: []const EncodedAtom,
+    pub fn init(
+        rule: *const lang.ast.Rule,
+        domain: *database.Domain,
+        domain_allocator: Allocator,
+        allocator: Allocator,
+    ) !RuleEvaluator {
+        const rh = try EncodedAtom.init(&rule.head, domain, domain_allocator, allocator);
+        const rb = try allocator.alloc(EncodedAtom, rule.body.len);
         for (rule.body, 0..) |*atom, j| {
-            rule_body[j] = try DomainTuple.init(atom, domain, allocator);
+            rb[j] = try EncodedAtom.init(atom, domain, domain_allocator, allocator);
         }
-        return DomainRule{
-            .head = rule_head,
-            .body = rule_body,
+        return RuleEvaluator{
             .source = rule,
+            .head = rh,
+            .body = rb,
         };
     }
-};
-
-pub const Evaluator = struct {
-    db: database.Db,
-    domain: database.Domain = .{},
-    program: std.ArrayListUnmanaged(DomainRule) = .{},
-    allocator: Allocator,
-    pub fn create(allocator: Allocator) Evaluator {
-        return .{
-            .db = database.Db.create(allocator),
-            .allocator = allocator,
-        };
+    pub fn deinit(self: *RuleEvaluator, allocator: Allocator) void {
+        self.head.deinit(allocator);
+        for (self.body) |*atom| atom.deinit(allocator);
+        allocator.free(self.body);
     }
-
-    pub fn read(self: *Evaluator, file: *const lang.ast.File, allocator: Allocator) Allocator.Error!void {
-        try self.program.ensureUnusedCapacity(allocator, file.statements.len);
-        for (file.statements) |*statement| {
-            const rule = try DomainRule.init(statement, &self.domain, allocator);
-            try self.db.setListRelationBackend(rule.head.relation);
-            self.program.appendAssumeCapacity(rule);
-        }
-    }
-    fn unify(self: *Evaluator, from: *const DomainTuple, with: *Bindings, into: *std.ArrayList(*Bindings), arena: *ArenaAllocator) !void {
-        const allocator = arena.allocator();
-        const query = try allocator.alloc(?u64, from.relation.arity);
-        defer allocator.free(query);
-        const result = try allocator.alloc(u64, from.relation.arity);
-        defer allocator.free(result);
-        from.initQuery(with, query);
-        var it = try self.db.query(from.relation, query, allocator);
-        defer it.destroy();
-        while (it.next(result)) {
-            try into.append(try from.unify(result, with, allocator));
-        }
-    }
-    fn infer(
-        self: *Evaluator,
-        from: *const DomainRule,
-        into: *std.ArrayList([]const u64),
-        arena: *ArenaAllocator,
+    pub fn evaluate(
+        self: *RuleEvaluator,
+        from: database.Db,
+        into: *database.tuples.DirectCollection,
+        allocator: Allocator,
     ) !void {
-        const allocator = arena.allocator();
+        const buffer = try allocator.alloc(u64, self.head.relation.arity);
+        defer allocator.free(buffer);
         const root = try allocator.create(Bindings);
-        root.* = .{};
-        const InferenceState = struct { *Bindings, []const DomainTuple };
+        root.* = .empty;
+        const InferenceState = struct { *Bindings, []const EncodedAtom };
         var queue = Queue(InferenceState).init(allocator);
         try queue.append(.{ root, from.body });
         while (queue.pop()) |state| {
             const bindings, const atoms = state;
             if (atoms.len == 0) {
-                const tuple = try allocator.alloc(u64, from.head.relation.arity);
-                errdefer allocator.free(tuple);
-                from.head.initTuple(bindings, tuple);
-                try into.append(tuple);
+                self.head.toTuple(bindings, buffer);
+                into.insert(allocator, buffer);
             } else {
-                var unified = std.ArrayList(*Bindings).init(allocator);
-                defer unified.deinit();
-                try self.unify(&atoms[0], bindings, &unified, arena);
-                for (unified.items) |candidate| {
+                const atom = atoms[0];
+                const query = try allocator.alloc(?u64, atom.relation.arity);
+                defer allocator.free(query);
+                const tuple = try allocator.alloc(u64, atom.relation.arity);
+                defer allocator.free(tuple);
+
+                atom.toQuery(bindings, query);
+                const it = try from.query(atom.relation, query, allocator);
+                defer it.destroy();
+                while (it.next(tuple)) {
+                    const candidate = try atom.unify(tuple, bindings, allocator);
                     try queue.append(.{ candidate, atoms[1..] });
                 }
             }
             bindings.deinit(allocator);
             allocator.destroy(bindings);
-        }
-    }
-    pub fn iterate(
-        self: *Evaluator,
-        arena: *ArenaAllocator,
-    ) !bool {
-        var discovered_new: bool = false;
-        const allocator = arena.allocator();
-        for (self.program.items) |*rule| {
-            var inferred = std.ArrayList([]const u64).init(allocator);
-            defer inferred.deinit();
-            try self.infer(rule, &inferred, arena);
-            for (inferred.items) |item| {
-                var tuple = database.iterators.SliceIterator{ .slice = item, .arity = item.len };
-                discovered_new = discovered_new or
-                    try self.db.insert(rule.head.relation, tuple.iterator(), allocator) > 0;
-            }
-        }
-        return discovered_new;
-    }
-    pub fn printDb(self: *Evaluator, allocator: Allocator, writer: std.io.AnyWriter) !void {
-        var arena = ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const local = arena.allocator();
-        var it = self.db.relations.iterator();
-        while (it.next()) |entry| {
-            const arity = entry.key_ptr.arity;
-
-            const query = try local.alloc(?u64, arity);
-            defer local.free(query);
-            const tuple = try local.alloc(u64, arity);
-            defer local.free(tuple);
-            const decoded = try local.alloc(database.DomainValue, arity);
-            defer local.free(decoded);
-
-            for (query) |*q| q.* = null;
-            var iterator = try self.db.query(entry.key_ptr.*, query, local);
-            defer iterator.destroy();
-            while (iterator.next(tuple)) {
-                self.domain.decodeTuple(tuple, decoded);
-                try writer.print("{s}(", .{entry.key_ptr.name});
-                for (decoded, 0..) |elem, j| {
-                    try writer.print("{s}", .{elem.binary});
-                    if (j + 1 < decoded.len) {
-                        try writer.print(",", .{});
-                    }
-                }
-                try writer.print(")\n", .{});
-            }
         }
     }
 };

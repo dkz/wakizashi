@@ -281,7 +281,7 @@ pub const iterators = struct {
 };
 
 /// Common tuple utilities;
-const tuples = struct {
+pub const tuples = struct {
     /// Test whether tuple matches the specified pattern.
     fn matches(pattern: []const ?u64, tuple: []const u64) bool {
         for (pattern, 0..) |pat, j| {
@@ -292,13 +292,13 @@ const tuples = struct {
 
     /// Stores tuples of same arity side by side in an array list,
     /// and provides a slice iterator for contents.
-    const DirectCollection = struct {
+    pub const DirectCollection = struct {
         arity: usize,
         array: ArrayListUnmanaged(u64) = .{},
-        fn deinit(self: *DirectCollection, allocator: Allocator) void {
+        pub fn deinit(self: *DirectCollection, allocator: Allocator) void {
             self.array.deinit(allocator);
         }
-        inline fn insert(
+        pub inline fn insert(
             self: *DirectCollection,
             allocator: Allocator,
             tuple: []const u64,
@@ -306,7 +306,7 @@ const tuples = struct {
             assert(self.arity == tuple.len);
             return self.array.appendSlice(allocator, tuple);
         }
-        inline fn insertFromIterator(
+        pub inline fn insertFromIterator(
             self: *DirectCollection,
             it: TupleIterator,
             allocator: Allocator,
@@ -315,16 +315,16 @@ const tuples = struct {
             defer allocator.free(buffer);
             while (it.next(buffer)) try self.insert(allocator, buffer);
         }
-        inline fn length(self: *DirectCollection) usize {
+        pub inline fn length(self: *DirectCollection) usize {
             return self.array.items.len / self.arity;
         }
-        inline fn elementAt(self: *DirectCollection, index: usize, elem: usize) u64 {
+        pub inline fn elementAt(self: *DirectCollection, index: usize, elem: usize) u64 {
             return self.array.items[index * self.arity + elem];
         }
-        inline fn tupleAt(self: *DirectCollection, index: usize) []u64 {
+        pub inline fn tupleAt(self: *DirectCollection, index: usize) []u64 {
             return self.array.items[index * self.arity .. self.arity + index * self.arity];
         }
-        fn iterator(self: *DirectCollection, allocator: Allocator) Allocator.Error!TupleIterator {
+        pub fn iterator(self: *DirectCollection, allocator: Allocator) Allocator.Error!TupleIterator {
             const it = try allocator.create(iterators.SliceIterator);
             it.* = .{ .allocator = allocator, .arity = self.arity, .slice = self.array.items };
             return it.iterator();
@@ -334,7 +334,7 @@ const tuples = struct {
             for (0..self.length()) |j| coll[j] = self.tupleAt(j).ptr;
             return coll;
         }
-        fn fromIterator(
+        pub fn fromIterator(
             arity: usize,
             it: TupleIterator,
             allocator: Allocator,
@@ -1223,38 +1223,20 @@ pub const Relation = struct {
 };
 
 pub const Db = struct {
-    const load_factor = std.hash_map.default_max_load_percentage;
-    allocator: Allocator,
-    relations: std.HashMapUnmanaged(Relation, *DynamicKDTree, Relation.Equality, load_factor) = .{},
-    pub fn create(allocator: Allocator) Db {
-        return .{ .allocator = allocator };
-    }
-    pub fn setListRelationBackend(self: *Db, relation: Relation) Allocator.Error!void {
-        if (!self.relations.contains(relation)) {
-            const backend = try self.allocator.create(DynamicKDTree);
-            backend.* = .{
-                .allocator = self.allocator,
-                .tuples = tuples.DirectCollection{ .arity = relation.arity },
-            };
-            try self.relations.put(self.allocator, relation, backend);
-        }
-    }
-    pub fn query(
-        self: *Db,
+    const QueryError = error.QueryError;
+    ptr: *anyopaque,
+    queryFn: *const fn (
+        ctx: *anyopaque,
         relation: Relation,
         pattern: []const ?u64,
         allocator: Allocator,
-    ) !TupleIterator {
-        const rel = self.relations.get(relation).?;
-        const backend = rel.queries();
-        return backend.query(pattern, allocator);
-    }
-    pub fn insert(
-        self: *Db,
+    ) QueryError!TupleIterator,
+    pub fn query(
+        self: Db,
         relation: Relation,
-        iterator: TupleIterator,
+        pattern: []const ?u64,
         allocator: Allocator,
-    ) !usize {
-        return self.relations.get(relation).?.storage().insert(iterator, allocator);
+    ) QueryError!TupleIterator {
+        return self.queryFn(self.ptr, relation, pattern, allocator);
     }
 };

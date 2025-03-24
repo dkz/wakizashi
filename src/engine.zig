@@ -170,12 +170,12 @@ pub const RuleEvaluator = struct {
         root.* = .empty;
         const InferenceState = struct { *Bindings, []const EncodedAtom };
         var queue = Queue(InferenceState).init(allocator);
-        try queue.append(.{ root, from.body });
+        try queue.append(.{ root, self.body });
         while (queue.pop()) |state| {
             const bindings, const atoms = state;
             if (atoms.len == 0) {
                 self.head.toTuple(bindings, buffer);
-                into.insert(allocator, buffer);
+                try into.insert(allocator, buffer);
             } else {
                 const atom = atoms[0];
                 const query = try allocator.alloc(?u64, atom.relation.arity);

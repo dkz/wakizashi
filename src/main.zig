@@ -54,8 +54,50 @@ pub fn main() !void {
         }
     }
 
-    for (stratum.items) |eval| {
-        try pretty_print(eval, stdout);
+    var facts_arena = ArenaAllocator.init(gpa.allocator());
+    defer facts_arena.deinit();
+    var facts = database.MemoryDb{ .allocator = facts_arena.allocator() };
+
+    while (true) {
+        var new: usize = 0;
+        for (stratum.items) |*eval| {
+            const relation = eval.head.relation;
+            var derived = database.tuples.DirectCollection{ .arity = relation.arity };
+            defer derived.deinit(gpa.allocator());
+            try eval.evaluate(facts.db(), &derived, gpa.allocator());
+            const it = try derived.iterator(gpa.allocator());
+            defer it.destroy();
+            new += try facts.store(relation, it, gpa.allocator());
+        }
+        if (new == 0) break;
+    }
+
+    var it = facts.relations.iterator();
+    while (it.next()) |e| {
+        const allocator = gpa.allocator();
+        try stdout.print("{s}/{}:\n", .{
+            e.key_ptr.name,
+            e.key_ptr.arity,
+        });
+        const buffer = try allocator.alloc(u64, e.key_ptr.arity);
+        defer allocator.free(buffer);
+        const values = try allocator.alloc(database.DomainValue, e.key_ptr.arity);
+        defer allocator.free(values);
+
+        const backend = e.value_ptr.queries();
+        var ts = try backend.each(gpa.allocator());
+        defer ts.destroy();
+        while (ts.next(buffer)) {
+            domain.decodeTuple(buffer, values);
+            try stdout.writeAll("\t(");
+            for (values, 1..) |*v, j| {
+                try stdout.writeAll(v.binary);
+                if (j < values.len) {
+                    try stdout.writeAll(", ");
+                }
+            }
+            try stdout.writeAll(")\n");
+        }
     }
 
     try stdout_buffered.flush();

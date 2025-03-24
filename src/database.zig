@@ -464,7 +464,7 @@ pub const QueryBackend = struct {
         self: *const QueryBackend,
         allocator: Allocator,
     ) Allocator.Error!TupleIterator {
-        self.eachFn(self.ptr, allocator);
+        return self.eachFn(self.ptr, allocator);
     }
 };
 
@@ -781,6 +781,7 @@ pub const DynamicKDTree = struct {
     ) Allocator.Error!usize {
         var count: usize = 0;
         const buffer = try allocator.alloc(u64, self.tuples.arity);
+        defer allocator.free(buffer);
         while (source.next(buffer)) {
             if (try self.insert(buffer)) count += 1;
         }
@@ -1223,7 +1224,7 @@ pub const Relation = struct {
 };
 
 pub const Db = struct {
-    const QueryError = error.QueryError;
+    const QueryError = error{QueryError} || Allocator.Error;
     ptr: *anyopaque,
     queryFn: *const fn (
         ctx: *anyopaque,
@@ -1238,5 +1239,59 @@ pub const Db = struct {
         allocator: Allocator,
     ) QueryError!TupleIterator {
         return self.queryFn(self.ptr, relation, pattern, allocator);
+    }
+};
+
+/// Trivial Db implementation backed by in-memory dynamic k-d trees.
+pub const MemoryDb = struct {
+    allocator: Allocator,
+    relations: HashMapUnmanaged(
+        Relation,
+        DynamicKDTree,
+        Relation.Equality,
+        std.hash_map.default_max_load_percentage,
+    ) = .empty,
+    pub fn store(
+        self: *MemoryDb,
+        relation: Relation,
+        source: TupleIterator,
+        allocator: Allocator,
+    ) !usize {
+        if (!self.relations.contains(relation)) {
+            try self.relations.put(
+                self.allocator,
+                relation,
+                DynamicKDTree{
+                    .allocator = self.allocator,
+                    .tuples = tuples.DirectCollection{
+                        .arity = relation.arity,
+                    },
+                },
+            );
+        }
+        if (self.relations.getPtr(relation)) |rel| {
+            return rel.insertFromIterator(source, allocator);
+        } else {
+            return 0;
+        }
+    }
+    pub fn db(self: *MemoryDb) Db {
+        const interface = struct {
+            fn queryFn(
+                ctx: *anyopaque,
+                relation: Relation,
+                pattern: []const ?u64,
+                allocator: Allocator,
+            ) Db.QueryError!TupleIterator {
+                const this: *MemoryDb = @ptrCast(@alignCast(ctx));
+                if (this.relations.getPtr(relation)) |rel| {
+                    return rel.query(pattern, allocator);
+                } else return error.QueryError;
+            }
+        };
+        return Db{
+            .ptr = self,
+            .queryFn = interface.queryFn,
+        };
     }
 };

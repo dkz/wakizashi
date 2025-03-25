@@ -22,10 +22,15 @@ pub fn main() !void {
     var source_arena = ArenaAllocator.init(gpa.allocator());
     defer source_arena.deinit();
 
-    var stratum: ArrayListUnmanaged(engine.RuleEvaluator) = .empty;
+    var stratum_rules: ArrayListUnmanaged(engine.EncodedRule) = .empty;
+    defer stratum_rules.deinit(gpa.allocator());
+    defer {
+        for (stratum_rules.items) |*rule| rule.deinit(gpa.allocator());
+    }
+    var stratum: ArrayListUnmanaged(engine.Evaluator) = .empty;
     defer stratum.deinit(gpa.allocator());
     defer {
-        for (stratum.items) |*rule| rule.deinit(gpa.allocator());
+        for (stratum.items) |*eval| eval.deinit(gpa.allocator());
     }
 
     const cwd = std.fs.cwd();
@@ -42,9 +47,9 @@ pub fn main() !void {
         };
         const file = try lang.ast.parse(a, source, &source_arena);
         for (file.statements) |*rule| {
-            try stratum.append(
+            try stratum_rules.append(
                 gpa.allocator(),
-                try engine.RuleEvaluator.init(
+                try engine.EncodedRule.init(
                     rule,
                     &domain,
                     domain_arena.allocator(),
@@ -54,17 +59,22 @@ pub fn main() !void {
         }
     }
 
+    for (stratum_rules.items) |*rule| {
+        try stratum.append(gpa.allocator(), try rule.naive(gpa.allocator()));
+    }
+
     var facts_arena = ArenaAllocator.init(gpa.allocator());
     defer facts_arena.deinit();
     var facts = database.MemoryDb{ .allocator = facts_arena.allocator() };
+    var delta = database.MemoryDb{ .allocator = facts_arena.allocator() };
 
     while (true) {
         var new: usize = 0;
         for (stratum.items) |*eval| {
-            const relation = eval.head.relation;
+            const relation = eval.rule.head.relation;
             var derived = database.tuples.DirectCollection{ .arity = relation.arity };
             defer derived.deinit(gpa.allocator());
-            try eval.evaluate(facts.db(), &derived, gpa.allocator());
+            try eval.evaluate(facts.db(), delta.db(), &derived, gpa.allocator());
             const it = try derived.iterator(gpa.allocator());
             defer it.destroy();
             new += try facts.store(relation, it, gpa.allocator());

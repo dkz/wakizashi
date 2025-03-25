@@ -220,6 +220,17 @@ pub const TupleIterator = struct {
 
 /// Namespace for common tuple iterators.
 pub const iterators = struct {
+    const EmptyIterator = struct {
+        fn destroyFn(_: *anyopaque) void {}
+        fn nextFn(_: *anyopaque, _: []u64) bool {
+            return false;
+        }
+    };
+    pub const empty = TupleIterator{
+        .ptr = @constCast(@ptrCast(&{})),
+        .nextFn = EmptyIterator.nextFn,
+        .destroyFn = EmptyIterator.destroyFn,
+    };
     pub const SliceIterator = struct {
         /// Null for on-stack iterators.
         allocator: ?Allocator = null,
@@ -1275,6 +1286,15 @@ pub const MemoryDb = struct {
             return 0;
         }
     }
+    pub fn merge(self: *MemoryDb, from: *MemoryDb, allocator: Allocator) !void {
+        var it = from.relations.iterator();
+        while (it.next()) |e| {
+            const backend = e.value_ptr.queries();
+            const iterator = try backend.each(allocator);
+            defer iterator.destroy();
+            _ = try self.store(e.key_ptr.*, iterator, allocator);
+        }
+    }
     pub fn db(self: *MemoryDb) Db {
         const interface = struct {
             fn queryFn(
@@ -1286,7 +1306,7 @@ pub const MemoryDb = struct {
                 const this: *MemoryDb = @ptrCast(@alignCast(ctx));
                 if (this.relations.getPtr(relation)) |rel| {
                     return rel.query(pattern, allocator);
-                } else return error.QueryError;
+                } else return iterators.empty;
             }
         };
         return Db{

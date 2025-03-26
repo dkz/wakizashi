@@ -1286,6 +1286,29 @@ pub const MemoryDb = struct {
             return 0;
         }
     }
+    pub fn storeTuple(
+        self: *MemoryDb,
+        relation: Relation,
+        tuple: []const u64,
+    ) !bool {
+        if (!self.relations.contains(relation)) {
+            try self.relations.put(
+                self.allocator,
+                relation,
+                DynamicKDTree{
+                    .allocator = self.allocator,
+                    .tuples = tuples.DirectCollection{
+                        .arity = relation.arity,
+                    },
+                },
+            );
+        }
+        if (self.relations.getPtr(relation)) |rel| {
+            return rel.insert(tuple);
+        } else {
+            return false;
+        }
+    }
     pub fn merge(self: *MemoryDb, from: *MemoryDb, allocator: Allocator) !void {
         var it = from.relations.iterator();
         while (it.next()) |e| {

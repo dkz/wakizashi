@@ -7,6 +7,7 @@ const assert = std.debug.assert;
 
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
+const ArrayListUnmanaged = std.ArrayListUnmanaged;
 
 fn Queue(comptime T: type) type {
     return struct {
@@ -217,6 +218,20 @@ pub const EncodedRule = struct {
             .rule = self,
             .annotations = ann,
         };
+    }
+    pub fn semi(
+        self: *EncodedRule,
+        into: *ArrayListUnmanaged(Evaluator),
+        allocator: Allocator,
+    ) !void {
+        for (0..self.body.len) |j| {
+            const ann = try allocator.alloc(Evaluator.AtomType, self.body.len);
+            for (ann, 0..) |*a, i| a.* = if (i == j) .delta else .idb;
+            try into.append(allocator, Evaluator{
+                .rule = self,
+                .annotations = ann,
+            });
+        }
     }
     pub fn deinit(self: *EncodedRule, allocator: Allocator) void {
         self.head.deinit(allocator);

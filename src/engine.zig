@@ -45,7 +45,7 @@ fn Queue(comptime T: type) type {
 const Name = []const u8;
 const Bindings = std.StringHashMapUnmanaged(u64);
 
-pub const EncodedAtom = struct {
+const EncodedAtom = struct {
     source: *const lang.ast.Atom,
     relation: database.Relation,
     encoded: []const Term,
@@ -135,13 +135,15 @@ pub const EncodedAtom = struct {
     }
 };
 
+const EncodedRule = struct {
+    source: *const lang.ast.Rule,
+    head: EncodedAtom,
+    body: []const EncodedAtom,
+};
+
 pub const Evaluator = struct {
-    const AtomType = enum { idb, delta };
     rule: *const EncodedRule,
-    annotations: []const AtomType,
-    pub fn deinit(self: *Evaluator, allocator: Allocator) void {
-        allocator.free(self.annotations);
-    }
+    delta_index: ?usize = null,
     pub fn evaluate(
         self: *Evaluator,
         idb: database.Db,
@@ -153,35 +155,34 @@ pub const Evaluator = struct {
         defer allocator.free(buffer);
         const root = try allocator.create(Bindings);
         root.* = .empty;
-        const InferenceState = struct {
-            *Bindings,
-            []const EncodedAtom,
-            []const AtomType,
-        };
+
+        const InferenceState = struct { *Bindings, usize };
         var queue = Queue(InferenceState).init(allocator);
-        try queue.append(.{ root, self.rule.body, self.annotations });
+        try queue.append(.{ root, 0 });
         while (queue.pop()) |state| {
-            const bindings, const atoms, const types = state;
-            if (atoms.len == 0) {
+            const bindings, const j = state;
+            if (self.rule.body.len == j) {
                 self.rule.head.toTuple(bindings, buffer);
                 try into.insert(allocator, buffer);
             } else {
-                const atom = atoms[0];
+                const atom = self.rule.body[j];
                 const query = try allocator.alloc(?u64, atom.relation.arity);
                 defer allocator.free(query);
                 const tuple = try allocator.alloc(u64, atom.relation.arity);
                 defer allocator.free(tuple);
 
                 atom.toQuery(bindings, query);
-                const from = switch (types[0]) {
-                    .delta => delta,
-                    .idb => idb,
+                const from = from: {
+                    if (self.delta_index) |di| {
+                        if (di == j) break :from delta;
+                    }
+                    break :from idb;
                 };
                 const it = try from.query(atom.relation, query, allocator);
                 defer it.destroy();
                 while (it.next(tuple)) {
                     const candidate = try atom.unify(tuple, bindings, allocator);
-                    try queue.append(.{ candidate, atoms[1..], types[1..] });
+                    try queue.append(.{ candidate, j + 1 });
                 }
             }
             bindings.deinit(allocator);
@@ -190,52 +191,107 @@ pub const Evaluator = struct {
     }
 };
 
-pub const EncodedRule = struct {
-    source: *const lang.ast.Rule,
-    head: EncodedAtom,
-    body: []const EncodedAtom,
-    pub fn init(
+pub const Stratum = struct {
+    rules: std.SegmentedList(EncodedRule, 0) = .{},
+    evals: ArrayListUnmanaged(Evaluator) = .empty,
+    inits: ArrayListUnmanaged(Evaluator) = .empty,
+    pub fn deinit(self: *Stratum, allocator: Allocator) void {
+        var it = self.rules.iterator(0);
+        while (it.next()) |ptr| {
+            for (ptr.body) |*a| a.deinit(allocator);
+            ptr.head.deinit(allocator);
+            allocator.free(ptr.body);
+        }
+        self.rules.deinit(allocator);
+        self.evals.deinit(allocator);
+        self.inits.deinit(allocator);
+    }
+    pub fn add(
+        self: *Stratum,
         rule: *const lang.ast.Rule,
         domain: *database.Domain,
         domain_allocator: Allocator,
         allocator: Allocator,
-    ) !EncodedRule {
-        const rh = try EncodedAtom.init(&rule.head, domain, domain_allocator, allocator);
-        const rb = try allocator.alloc(EncodedAtom, rule.body.len);
-        for (rule.body, 0..) |*atom, j| {
-            rb[j] = try EncodedAtom.init(atom, domain, domain_allocator, allocator);
+    ) Allocator.Error!void {
+        const encoded = try self.rules.addOne(allocator);
+        {
+            const body = try allocator.alloc(EncodedAtom, rule.body.len);
+            const head = try EncodedAtom.init(
+                &rule.head,
+                domain,
+                domain_allocator,
+                allocator,
+            );
+            for (rule.body, 0..) |*atom, j| {
+                body[j] = try EncodedAtom.init(
+                    atom,
+                    domain,
+                    domain_allocator,
+                    allocator,
+                );
+            }
+            encoded.* = EncodedRule{
+                .source = rule,
+                .head = head,
+                .body = body,
+            };
         }
-        return EncodedRule{
-            .source = rule,
-            .head = rh,
-            .body = rb,
-        };
-    }
-    pub fn naive(self: *EncodedRule, allocator: Allocator) !Evaluator {
-        const ann = try allocator.alloc(Evaluator.AtomType, self.body.len);
-        for (ann) |*a| a.* = Evaluator.AtomType.idb;
-        return Evaluator{
-            .rule = self,
-            .annotations = ann,
-        };
-    }
-    pub fn semi(
-        self: *EncodedRule,
-        into: *ArrayListUnmanaged(Evaluator),
-        allocator: Allocator,
-    ) !void {
-        for (0..self.body.len) |j| {
-            const ann = try allocator.alloc(Evaluator.AtomType, self.body.len);
-            for (ann, 0..) |*a, i| a.* = if (i == j) .delta else .idb;
-            try into.append(allocator, Evaluator{
-                .rule = self,
-                .annotations = ann,
+        try self.inits.append(allocator, Evaluator{ .rule = encoded });
+        for (0..rule.body.len) |j| {
+            try self.evals.append(allocator, Evaluator{
+                .rule = encoded,
+                .delta_index = j,
             });
         }
     }
-    pub fn deinit(self: *EncodedRule, allocator: Allocator) void {
-        self.head.deinit(allocator);
-        for (self.body) |*atom| atom.deinit(allocator);
-        allocator.free(self.body);
+    pub fn evaluate(
+        self: *Stratum,
+        facts: *database.MemoryDb,
+        allocator: Allocator,
+    ) !void {
+        var delta_arena = ArenaAllocator.init(allocator);
+        var delta = database.MemoryDb{ .allocator = delta_arena.allocator() };
+        for (self.inits.items) |*eval| {
+            const relation = eval.rule.head.relation;
+            var derived = database.tuples.DirectCollection{ .arity = relation.arity };
+            defer derived.deinit(allocator);
+            try eval.evaluate(facts.db(), delta.db(), &derived, allocator);
+            const it = try derived.iterator(allocator);
+            defer it.destroy();
+            _ = try delta.store(relation, it, allocator);
+        }
+        try facts.merge(&delta, allocator);
+
+        var current_arena = delta_arena;
+        var current_delta = delta;
+        while (true) {
+            var future_arena = ArenaAllocator.init(allocator);
+            var future_delta = database.MemoryDb{ .allocator = future_arena.allocator() };
+            var new = false;
+            for (self.evals.items) |*eval| {
+                const relation = eval.rule.head.relation;
+                var derived = database.tuples.DirectCollection{ .arity = relation.arity };
+                defer derived.deinit(allocator);
+                try eval.evaluate(facts.db(), current_delta.db(), &derived, allocator);
+                const it = try derived.iterator(allocator);
+                defer it.destroy();
+                const buffer = try allocator.alloc(u64, relation.arity);
+                defer allocator.free(buffer);
+                while (it.next(buffer)) {
+                    if (try facts.storeTuple(relation, buffer)) {
+                        new = try future_delta.storeTuple(relation, buffer) or new;
+                    }
+                }
+            }
+            if (new) {
+                current_arena.deinit();
+                current_delta = future_delta;
+                current_arena = future_arena;
+            } else {
+                current_arena.deinit();
+                future_arena.deinit();
+                break;
+            }
+        }
     }
 };

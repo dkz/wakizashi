@@ -23,21 +23,8 @@ pub fn main() !void {
     var source_arena = ArenaAllocator.init(gpa.allocator());
     defer source_arena.deinit();
 
-    var stratum_rules: ArrayListUnmanaged(engine.EncodedRule) = .empty;
-    defer stratum_rules.deinit(gpa.allocator());
-    defer {
-        for (stratum_rules.items) |*rule| rule.deinit(gpa.allocator());
-    }
-    var round1: ArrayListUnmanaged(engine.Evaluator) = .empty;
-    defer round1.deinit(gpa.allocator());
-    defer {
-        for (round1.items) |*eval| eval.deinit(gpa.allocator());
-    }
-    var stratum: ArrayListUnmanaged(engine.Evaluator) = .empty;
+    var stratum = engine.Stratum{};
     defer stratum.deinit(gpa.allocator());
-    defer {
-        for (stratum.items) |*eval| eval.deinit(gpa.allocator());
-    }
 
     const cwd = std.fs.cwd();
     var args = try std.process.argsWithAllocator(gpa.allocator());
@@ -53,79 +40,20 @@ pub fn main() !void {
         };
         const file = try lang.ast.parse(a, source, &source_arena);
         for (file.statements) |*rule| {
-            try stratum_rules.append(
+            try stratum.add(
+                rule,
+                &domain,
+                domain_arena.allocator(),
                 gpa.allocator(),
-                try engine.EncodedRule.init(
-                    rule,
-                    &domain,
-                    domain_arena.allocator(),
-                    gpa.allocator(),
-                ),
             );
         }
-    }
-
-    for (stratum_rules.items) |*rule| {
-        try round1.append(gpa.allocator(), try rule.naive(gpa.allocator()));
-        try rule.semi(&stratum, gpa.allocator());
     }
 
     var facts_arena = ArenaAllocator.init(gpa.allocator());
     defer facts_arena.deinit();
     var facts = database.MemoryDb{ .allocator = facts_arena.allocator() };
 
-    var delta_arena = ArenaAllocator.init(gpa.allocator());
-    var delta = database.MemoryDb{ .allocator = delta_arena.allocator() };
-
-    for (round1.items) |*eval| {
-        const relation = eval.rule.head.relation;
-        var derived = database.tuples.DirectCollection{ .arity = relation.arity };
-        defer derived.deinit(gpa.allocator());
-        try eval.evaluate(facts.db(), delta.db(), &derived, gpa.allocator());
-        const it = try derived.iterator(gpa.allocator());
-        defer it.destroy();
-        _ = try delta.store(relation, it, gpa.allocator());
-    }
-
-    try facts.merge(&delta, gpa.allocator());
-
-    var current_arena = delta_arena;
-    var current_delta = delta;
-    while (true) {
-        try stdout.writeAll("DELTA:\n");
-        try print_db(stdout, &domain, &current_delta, gpa.allocator());
-        var future_arena = ArenaAllocator.init(gpa.allocator());
-        var future_delta = database.MemoryDb{ .allocator = future_arena.allocator() };
-        var new = false;
-        for (stratum.items) |*eval| {
-            const relation = eval.rule.head.relation;
-            const vb = try gpa.allocator().alloc(database.DomainValue, relation.arity);
-            defer gpa.allocator().free(vb);
-            var derived = database.tuples.DirectCollection{ .arity = relation.arity };
-            defer derived.deinit(gpa.allocator());
-            try eval.evaluate(facts.db(), current_delta.db(), &derived, gpa.allocator());
-            const it = try derived.iterator(gpa.allocator());
-            defer it.destroy();
-            const buffer = try gpa.allocator().alloc(u64, relation.arity);
-            defer gpa.allocator().free(buffer);
-            while (it.next(buffer)) {
-                if (try facts.storeTuple(relation, buffer)) {
-                    try stdout.writeAll(relation.name);
-                    try print_tuple(stdout, &domain, buffer, vb);
-                    new = try future_delta.storeTuple(relation, buffer) or new;
-                }
-            }
-        }
-        if (new) {
-            current_arena.deinit();
-            current_delta = future_delta;
-            current_arena = future_arena;
-        } else {
-            current_arena.deinit();
-            future_arena.deinit();
-            break;
-        }
-    }
+    try stratum.evaluate(&facts, gpa.allocator());
 
     try stdout.writeAll("FACTS:\n");
     try print_db(stdout, &domain, &facts, gpa.allocator());

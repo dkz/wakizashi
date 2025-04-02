@@ -38,7 +38,7 @@ pub fn main() !void {
             const rdr = reader.reader();
             break :source try rdr.readAllAlloc(source_arena.allocator(), 1024 * 8);
         };
-        const file = try lang.ast.parse(a, source, &source_arena);
+        const file = try lang.ast.parse(a, source, source_arena.allocator());
         for (file.statements) |*rule| {
             try stratum.add(
                 rule,

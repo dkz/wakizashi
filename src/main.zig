@@ -13,6 +13,79 @@ const File = std.fs.File;
 
 const panic = std.debug.panic;
 
+const LineSplitter = struct {
+    position: usize = 0,
+    string: []const u8,
+    fn next(self: *LineSplitter) ?[]const u8 {
+        const start = self.position;
+        if (self.position == self.string.len) return null;
+        while (true) {
+            if (self.position == self.string.len) {
+                return self.string[start..self.position];
+            }
+            if (self.string[self.position] == '\n') {
+                const end = self.position;
+                self.position += 1;
+                return self.string[start..end];
+            }
+            self.position += 1;
+        }
+    }
+};
+
+const CodeContext = struct {
+    line: []const u8,
+    subtext: ?struct { usize, []const u8 } = null,
+};
+
+fn errorMessageBox(
+    out: File,
+    comptime format: []const u8,
+    args: anytype,
+    comment: []const u8,
+    code: CodeContext,
+) !void {
+    const colors = tty.detectConfig(out);
+    const writer = out.writer();
+    try colors.setColor(writer, tty.Color.red);
+    try writer.writeAll("\u{250f}\u{2578} ");
+    try colors.setColor(writer, tty.Color.bold);
+    try writer.print(format, args);
+    try writer.writeByte('\n');
+
+    var splitter = LineSplitter{ .string = comment };
+    while (splitter.next()) |line| {
+        try colors.setColor(writer, tty.Color.reset);
+        try colors.setColor(writer, tty.Color.red);
+        try writer.writeAll("\u{2503} ");
+        try colors.setColor(writer, tty.Color.reset);
+        try colors.setColor(writer, tty.Color.dim);
+        try writer.print("{s}\n", .{line});
+    }
+
+    try colors.setColor(writer, tty.Color.reset);
+    try colors.setColor(writer, tty.Color.red);
+    try writer.writeAll("\u{2503} ");
+
+    try colors.setColor(writer, tty.Color.white);
+    try writer.print("{s}\n", .{code.line});
+
+    if (code.subtext) |sub| {
+        try colors.setColor(writer, tty.Color.reset);
+        try colors.setColor(writer, tty.Color.red);
+        try writer.writeAll("\u{2503} ");
+
+        const pos, const msg = sub;
+        try colors.setColor(writer, tty.Color.white);
+        for (1..pos) |_| try writer.writeByte(' ');
+        try writer.print("^ {s}\n", .{msg});
+    }
+    try colors.setColor(writer, tty.Color.reset);
+    try colors.setColor(writer, tty.Color.red);
+    try writer.print("\u{2579}\n", .{});
+    try colors.setColor(writer, tty.Color.reset);
+}
+
 const ReportingHandler = struct {
     dest: File,
     fn handler(self: *ReportingHandler) lang.ErrorHandler {
@@ -20,12 +93,16 @@ const ReportingHandler = struct {
             fn onUnknownToken(ctx: *anyopaque, an: lang.Annotation) void {
                 errdefer unreachable;
                 const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
-                const writer = this.dest.writer();
-                try writer.print("Unknown token at {}:{}:\n\t{s}\n", .{
-                    an.line,
-                    an.column,
-                    an.view(),
-                });
+                try errorMessageBox(
+                    this.dest,
+                    "{s}:{}:{} tokenizer error:",
+                    .{ an.source.name, an.line, an.column },
+                    "Unknown token",
+                    .{
+                        .line = an.view(),
+                        .subtext = .{ an.column, "here" },
+                    },
+                );
             }
         };
         return lang.ErrorHandler{

@@ -1,4 +1,5 @@
 const std = @import("std");
+const tty = std.io.tty;
 
 const lang = @import("lang.zig");
 const database = @import("database.zig");
@@ -8,7 +9,38 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayListUnmanaged = std.ArrayListUnmanaged;
 
+const File = std.fs.File;
+
+const panic = std.debug.panic;
+
+const ReportingHandler = struct {
+    dest: File,
+    fn handler(self: *ReportingHandler) lang.ErrorHandler {
+        const interface = struct {
+            fn onUnknownToken(ctx: *anyopaque, an: lang.Annotation) void {
+                errdefer unreachable;
+                const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
+                const writer = this.dest.writer();
+                try writer.print("Unknown token at {}:{}:\n\t{s}\n", .{
+                    an.line,
+                    an.column,
+                    an.view(),
+                });
+            }
+        };
+        return lang.ErrorHandler{
+            .ptr = self,
+            .vtable = .{
+                .onUnknownToken = interface.onUnknownToken,
+            },
+        };
+    }
+};
+
 pub fn main() !void {
+    var reporting = ReportingHandler{
+        .dest = std.io.getStdOut(),
+    };
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
@@ -33,12 +65,16 @@ pub fn main() !void {
     while (args.next()) |a| {
         var source_file = try cwd.openFile(a, .{});
         defer source_file.close();
-        const source = source: {
+        const code = code: {
             var reader = std.io.bufferedReader(source_file.reader());
             const rdr = reader.reader();
-            break :source try rdr.readAllAlloc(source_arena.allocator(), 1024 * 8);
+            break :code try rdr.readAllAlloc(source_arena.allocator(), 1024 * 8);
         };
-        const file = try lang.ast.parse(a, source, source_arena.allocator());
+        const file = try lang.ast.parse(
+            lang.Source{ .name = a, .code = code },
+            reporting.handler(),
+            source_arena.allocator(),
+        );
         for (file.statements) |*rule| {
             try stratum.add(
                 rule,

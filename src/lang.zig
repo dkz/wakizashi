@@ -7,17 +7,24 @@ const ArrayListUnmanaged = std.ArrayListUnmanaged;
 const panic = std.debug.panic;
 const assert = std.debug.assert;
 
+pub const Source = struct {
+    name: []const u8,
+    code: []const u8,
+};
+
 pub const Annotation = struct {
+    source: Source,
+    position: usize,
     line: u32,
     column: u32,
-    fn annotate(source: []const u8, at: usize) Annotation {
+    fn annotate(source: Source, at: usize) Annotation {
         std.debug.assert(0 <= at);
-        std.debug.assert(at < source.len);
+        std.debug.assert(at < source.code.len);
         var j: u32 = 0;
         var lines: u32 = 1;
         var column: u32 = 0;
         while (j <= at) {
-            switch (source[j]) {
+            switch (source.code[j]) {
                 '\n' => {
                     lines += 1;
                     column = 0;
@@ -31,7 +38,34 @@ pub const Annotation = struct {
         return .{
             .line = lines,
             .column = column,
+            .position = at,
+            .source = source,
         };
+    }
+    pub fn view(self: Annotation) []const u8 {
+        var from = self.position;
+        while (true) {
+            if (from == 0) break;
+            if (self.source.code[from - 1] == '\n') break;
+            from -= 1;
+        }
+        var to = self.position;
+        while (true) {
+            if (to == self.source.code.len) break;
+            if (self.source.code[to] == '\n') break;
+            to += 1;
+        }
+        return self.source.code[from..to];
+    }
+};
+
+pub const ErrorHandler = struct {
+    ptr: *anyopaque,
+    vtable: struct {
+        onUnknownToken: *const fn (ptr: *anyopaque, an: Annotation) void,
+    },
+    fn onUnknownToken(self: ErrorHandler, an: Annotation) void {
+        self.vtable.onUnknownToken(self.ptr, an);
     }
 };
 
@@ -57,41 +91,43 @@ pub const ast = struct {
         token: u32,
     };
     pub const File = struct {
-        name: []const u8,
-        source: []const u8,
+        source: Source,
         tokens: []const Token,
         statements: []const Rule,
         pub fn annotateRule(self: *const File, rule: *const Rule) Annotation {
             const token = &self.tokens[rule.token];
-            const start = @intFromPtr(self.source.ptr);
+            const start = @intFromPtr(self.source.code.ptr);
             const end = @intFromPtr(token.slice.ptr);
             return Annotation.annotate(self.source, end - start);
         }
         pub fn annotateAtom(self: *const File, atom: *const Atom) Annotation {
             const token = &self.tokens[atom.token];
-            const start = @intFromPtr(self.source.ptr);
+            const start = @intFromPtr(self.source.code.ptr);
             const end = @intFromPtr(token.slice.ptr);
             return Annotation.annotate(self.source, end - start);
         }
     };
 
     /// Extract an abstract syntax tree from file buffer contents named `name`.
-    pub fn parse(name: []const u8, source: []const u8, allocator: Allocator) !File {
+    pub fn parse(
+        source: Source,
+        handler: ErrorHandler,
+        allocator: Allocator,
+    ) (Allocator.Error || error{ParseError})!File {
         const tokens = tokens: {
+            var error_state: bool = false;
             var stream = TokenStream{ .source = source };
             var ts: ArrayListUnmanaged(Token) = .empty;
-            while (stream.next() catch |e| {
-                const ann = stream.annotation();
-                switch (e) {
-                    error.UnknownToken => {
-                        panic("{s}:{} Unknown token on position {}", .{
-                            name,
-                            ann.line,
-                            ann.column,
-                        });
+            while (true) {
+                const token = stream.next(handler) catch |e| switch (e) {
+                    error.ParseError => {
+                        error_state = true;
+                        continue;
                     },
-                }
-            }) |t| try ts.append(allocator, t);
+                };
+                if (token) |t| try ts.append(allocator, t) else break;
+            }
+            if (error_state) return error.ParseError;
             break :tokens try ts.toOwnedSlice(allocator);
         };
         var statements: ArrayListUnmanaged(Rule) = .empty;
@@ -101,7 +137,6 @@ pub const ast = struct {
             try statements.append(allocator, rule);
         }
         return File{
-            .name = name,
             .source = source,
             .tokens = tokens,
             .statements = try statements.toOwnedSlice(allocator),
@@ -166,7 +201,7 @@ const Parser = struct {
                 parser,
             };
         }
-        return error.ParserError;
+        return error.ParseError;
     }
 
     /// Predicate symbol.
@@ -278,23 +313,20 @@ const Token = struct {
 };
 
 const TokenStream = struct {
-    const Error = error{
-        UnknownToken,
-    };
-    source: []const u8,
+    source: Source,
     cursor: usize = 0,
     fn peek(self: *TokenStream) ?u8 {
-        if (self.cursor >= self.source.len) return null;
-        return self.source[self.cursor];
+        if (self.cursor >= self.source.code.len) return null;
+        return self.source.code[self.cursor];
     }
     fn skip(self: *TokenStream) void {
-        if (self.cursor >= self.source.len) return;
+        if (self.cursor >= self.source.code.len) return;
         self.cursor += 1;
     }
     fn annotation(self: *TokenStream) Annotation {
         return Annotation.annotate(self.source, self.cursor);
     }
-    fn next(self: *TokenStream) Error!?Token {
+    fn next(self: *TokenStream, handler: ErrorHandler) error{ParseError}!?Token {
         while (self.peek()) |char| {
             switch (char) {
                 ' ' => self.skip(),
@@ -310,13 +342,15 @@ const TokenStream = struct {
                     if (std.ascii.isAlphabetic(char) or char == '_') {
                         return self.onIdentifier();
                     }
-                    return error.UnknownToken;
+                    handler.onUnknownToken(self.annotation());
+                    self.skip();
+                    return error.ParseError;
                 },
             }
         } else return null;
     }
     inline fn produce(self: *TokenStream, t: Token.Type, from: usize) Token {
-        return .{ .t = t, .slice = self.source[from..self.cursor] };
+        return .{ .t = t, .slice = self.source.code[from..self.cursor] };
     }
     inline fn onNewline(self: *TokenStream) void {
         self.skip();
@@ -356,7 +390,7 @@ const TokenStream = struct {
                 return self.produce(.implication, from);
             }
         }
-        return error.UnknownToken;
+        return null; // TODO should be an error;
     }
     inline fn onString(self: *TokenStream) ?Token {
         self.skip();

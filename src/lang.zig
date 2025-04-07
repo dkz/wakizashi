@@ -398,6 +398,7 @@ const TokenStream = struct {
         return error.ParseError;
     }
     inline fn onString(self: *TokenStream, handler: ErrorHandler) !?Token {
+        const start = self.cursor;
         self.skip();
         const from = self.cursor;
         while (self.peek()) |char| {
@@ -411,7 +412,7 @@ const TokenStream = struct {
                 return token;
             }
         }
-        handler.onMalformedString(self.annotation(from));
+        handler.onMalformedString(self.annotation(start));
         return error.ParseError;
     }
     inline fn onIdentifier(self: *TokenStream) Token {

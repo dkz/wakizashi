@@ -120,7 +120,7 @@ const ErrorReport = union(enum) {
         switch (self.*) {
             .text => |out| {
                 const writer = out.writer();
-                writer.writeByte('\n');
+                try writer.writeByte('\n');
             },
             .term => |out| {
                 const term, const colors = out;

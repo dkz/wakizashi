@@ -63,9 +63,13 @@ pub const ErrorHandler = struct {
     ptr: *anyopaque,
     vtable: struct {
         onUnknownToken: *const fn (ptr: *anyopaque, an: Annotation) void,
+        onMalformedString: *const fn (ptr: *anyopaque, an: Annotation) void,
     },
     fn onUnknownToken(self: ErrorHandler, an: Annotation) void {
         self.vtable.onUnknownToken(self.ptr, an);
+    }
+    fn onMalformedString(self: ErrorHandler, an: Annotation) void {
+        self.vtable.onMalformedString(self.ptr, an);
     }
 };
 
@@ -323,8 +327,8 @@ const TokenStream = struct {
         if (self.cursor >= self.source.code.len) return;
         self.cursor += 1;
     }
-    fn annotation(self: *TokenStream) Annotation {
-        return Annotation.annotate(self.source, self.cursor);
+    fn annotation(self: *TokenStream, at: usize) Annotation {
+        return Annotation.annotate(self.source, at);
     }
     fn next(self: *TokenStream, handler: ErrorHandler) error{ParseError}!?Token {
         while (self.peek()) |char| {
@@ -335,14 +339,14 @@ const TokenStream = struct {
                 ',' => return self.onComma(),
                 '(' => return self.onParenthesisLeft(),
                 ')' => return self.onParenthesisRight(),
-                ':' => if (self.onColon()) |t| return t,
-                '\'' => if (self.onString()) |t| return t,
+                ':' => if (try self.onColon(handler)) |t| return t,
+                '\'' => if (try self.onString(handler)) |t| return t,
                 '\n' => self.onNewline(),
                 else => {
                     if (std.ascii.isAlphabetic(char) or char == '_') {
                         return self.onIdentifier();
                     }
-                    handler.onUnknownToken(self.annotation());
+                    handler.onUnknownToken(self.annotation(self.cursor));
                     self.skip();
                     return error.ParseError;
                 },
@@ -381,7 +385,7 @@ const TokenStream = struct {
             self.skip();
         }
     }
-    inline fn onColon(self: *TokenStream) ?Token {
+    inline fn onColon(self: *TokenStream, handler: ErrorHandler) !?Token {
         const from = self.cursor;
         self.skip();
         if (self.peek()) |char| {
@@ -390,9 +394,10 @@ const TokenStream = struct {
                 return self.produce(.implication, from);
             }
         }
-        return null; // TODO should be an error;
+        handler.onUnknownToken(self.annotation(from));
+        return error.ParseError;
     }
-    inline fn onString(self: *TokenStream) ?Token {
+    inline fn onString(self: *TokenStream, handler: ErrorHandler) !?Token {
         self.skip();
         const from = self.cursor;
         while (self.peek()) |char| {
@@ -406,7 +411,8 @@ const TokenStream = struct {
                 return token;
             }
         }
-        return null; // TODO should be an error;
+        handler.onMalformedString(self.annotation(from));
+        return error.ParseError;
     }
     inline fn onIdentifier(self: *TokenStream) Token {
         const from = self.cursor;

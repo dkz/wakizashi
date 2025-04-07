@@ -10,81 +10,129 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const ArrayListUnmanaged = std.ArrayListUnmanaged;
 
 const File = std.fs.File;
-
 const panic = std.debug.panic;
 
-const LineSplitter = struct {
-    position: usize = 0,
-    string: []const u8,
-    fn next(self: *LineSplitter) ?[]const u8 {
-        const start = self.position;
-        if (self.position == self.string.len) return null;
-        while (true) {
-            if (self.position == self.string.len) {
-                return self.string[start..self.position];
-            }
-            if (self.string[self.position] == '\n') {
-                const end = self.position;
-                self.position += 1;
-                return self.string[start..end];
-            }
-            self.position += 1;
+const ErrorReport = union(enum) {
+    text: File,
+    term: struct { File, tty.Config },
+
+    fn init(from: File) ErrorReport {
+        const colors = tty.detectConfig(from);
+        return switch (colors) {
+            .no_color => ErrorReport{ .text = from },
+            else => ErrorReport{ .term = .{ from, colors } },
+        };
+    }
+
+    fn header(
+        self: *ErrorReport,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !void {
+        switch (self.*) {
+            .text => |out| {
+                const writer = out.writer();
+                try writer.print(fmt, args);
+                try writer.writeByte('\n');
+            },
+            .term => |out| {
+                const term, const colors = out;
+                const writer = term.writer();
+                try colors.setColor(writer, tty.Color.reset);
+                try colors.setColor(writer, tty.Color.red);
+                try writer.writeAll("\u{250f}\u{2578} ");
+                try writer.print(fmt, args);
+                try colors.setColor(writer, tty.Color.bold);
+                try writer.writeByte('\n');
+                try colors.setColor(writer, tty.Color.reset);
+            },
+        }
+    }
+    fn message(self: *ErrorReport, comptime fmt: []const u8, args: anytype) !void {
+        switch (self.*) {
+            .text => |out| {
+                const writer = out.writer();
+                try writer.writeByte('\t');
+                try writer.print(fmt, args);
+                try writer.writeByte('\n');
+            },
+            .term => |out| {
+                const term, const colors = out;
+                const writer = term.writer();
+                try colors.setColor(writer, tty.Color.reset);
+                try colors.setColor(writer, tty.Color.red);
+                try writer.writeAll("\u{2503} ");
+                try colors.setColor(writer, tty.Color.reset);
+                try colors.setColor(writer, tty.Color.dim);
+                try writer.print(fmt, args);
+                try writer.writeByte('\n');
+                try colors.setColor(writer, tty.Color.reset);
+            },
+        }
+    }
+    fn code(self: *ErrorReport, line: []const u8) !void {
+        switch (self.*) {
+            .text => |out| {
+                const writer = out.writer();
+                try writer.writeByte('\t');
+                try writer.writeAll(line);
+                try writer.writeByte('\n');
+            },
+            .term => |out| {
+                const term, const colors = out;
+                const writer = term.writer();
+                try colors.setColor(writer, tty.Color.reset);
+                try colors.setColor(writer, tty.Color.red);
+                try writer.writeAll("\u{2503} ");
+                try colors.setColor(writer, tty.Color.white);
+                try writer.writeAll(line);
+                try writer.writeByte('\n');
+                try colors.setColor(writer, tty.Color.reset);
+            },
+        }
+    }
+    fn pointAt(self: *ErrorReport, column: usize, comptime fmt: []const u8, args: anytype) !void {
+        switch (self.*) {
+            .text => |out| {
+                const writer = out.writer();
+                try writer.writeByte('\t');
+                for (1..column) |_| try writer.writeByte(' ');
+                try writer.writeAll("^ ");
+                try writer.print(fmt, args);
+                try writer.writeByte('\n');
+            },
+            .term => |out| {
+                const term, const colors = out;
+                const writer = term.writer();
+                try colors.setColor(writer, tty.Color.reset);
+                try colors.setColor(writer, tty.Color.red);
+                try writer.writeAll("\u{2503} ");
+                try colors.setColor(writer, tty.Color.white);
+                for (1..column) |_| try writer.writeByte(' ');
+                try writer.writeAll("^ ");
+                try writer.print(fmt, args);
+                try writer.writeByte('\n');
+                try colors.setColor(writer, tty.Color.reset);
+            },
+        }
+    }
+    fn footer(self: *ErrorReport) !void {
+        switch (self.*) {
+            .text => |out| {
+                const writer = out.writer();
+                writer.writeByte('\n');
+            },
+            .term => |out| {
+                const term, const colors = out;
+                const writer = term.writer();
+                try colors.setColor(writer, tty.Color.reset);
+                try colors.setColor(writer, tty.Color.red);
+                try writer.print("\u{2579}\n", .{});
+                try colors.setColor(writer, tty.Color.reset);
+            },
         }
     }
 };
-
-const CodeContext = struct {
-    line: []const u8,
-    subtext: ?struct { usize, []const u8 } = null,
-};
-
-fn errorMessageBox(
-    out: File,
-    comptime format: []const u8,
-    args: anytype,
-    comment: []const u8,
-    code: CodeContext,
-) !void {
-    const colors = tty.detectConfig(out);
-    const writer = out.writer();
-    try colors.setColor(writer, tty.Color.red);
-    try writer.writeAll("\u{250f}\u{2578} ");
-    try colors.setColor(writer, tty.Color.bold);
-    try writer.print(format, args);
-    try writer.writeByte('\n');
-
-    var splitter = LineSplitter{ .string = comment };
-    while (splitter.next()) |line| {
-        try colors.setColor(writer, tty.Color.reset);
-        try colors.setColor(writer, tty.Color.red);
-        try writer.writeAll("\u{2503} ");
-        try colors.setColor(writer, tty.Color.reset);
-        try colors.setColor(writer, tty.Color.dim);
-        try writer.print("{s}\n", .{line});
-    }
-
-    try colors.setColor(writer, tty.Color.reset);
-    try colors.setColor(writer, tty.Color.red);
-    try writer.writeAll("\u{2503} ");
-
-    try colors.setColor(writer, tty.Color.white);
-    try writer.print("{s}\n", .{code.line});
-
-    if (code.subtext) |sub| {
-        try colors.setColor(writer, tty.Color.reset);
-        try colors.setColor(writer, tty.Color.red);
-        try writer.writeAll("\u{2503} ");
-
-        const pos, const msg = sub;
-        try colors.setColor(writer, tty.Color.white);
-        for (1..pos) |_| try writer.writeByte(' ');
-        try writer.print("^ {s}\n", .{msg});
-    }
-    try colors.setColor(writer, tty.Color.reset);
-    try colors.setColor(writer, tty.Color.red);
-    try writer.print("\u{2579}\n", .{});
-    try colors.setColor(writer, tty.Color.reset);
-}
 
 const ReportingHandler = struct {
     dest: File,
@@ -93,22 +141,35 @@ const ReportingHandler = struct {
             fn onUnknownToken(ctx: *anyopaque, an: lang.Annotation) void {
                 errdefer unreachable;
                 const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
-                try errorMessageBox(
-                    this.dest,
+                var r = ErrorReport.init(this.dest);
+                try r.header(
                     "{s}:{}:{} tokenizer error:",
                     .{ an.source.name, an.line, an.column },
-                    "Unknown token",
-                    .{
-                        .line = an.view(),
-                        .subtext = .{ an.column, "here" },
-                    },
                 );
+                try r.message("Unknown token", .{});
+                try r.code(an.view());
+                try r.pointAt(an.column, "here", .{});
+                try r.footer();
+            }
+            fn onMalformedString(ctx: *anyopaque, an: lang.Annotation) void {
+                errdefer unreachable;
+                const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
+                var r = ErrorReport.init(this.dest);
+                try r.header(
+                    "{s}:{}:{} tokenizer error:",
+                    .{ an.source.name, an.line, an.column },
+                );
+                try r.message("Malformed string", .{});
+                try r.code(an.view());
+                try r.pointAt(an.column, "here", .{});
+                try r.footer();
             }
         };
         return lang.ErrorHandler{
             .ptr = self,
             .vtable = .{
                 .onUnknownToken = interface.onUnknownToken,
+                .onMalformedString = interface.onMalformedString,
             },
         };
     }

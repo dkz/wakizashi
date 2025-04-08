@@ -58,18 +58,43 @@ pub const Annotation = struct {
         return self.source.code[from..to];
     }
 };
+pub const TokenAnnotation = struct { Token, Annotation };
 
 pub const ErrorHandler = struct {
     ptr: *anyopaque,
     vtable: struct {
         onUnknownToken: *const fn (ptr: *anyopaque, an: Annotation) void,
         onMalformedString: *const fn (ptr: *anyopaque, an: Annotation) void,
+        onExpectedTerm: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
+        onExpectedPredicate: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
+        onExpectedRuleClause: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
+        onExpectedRuleDef: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
+        onExpectedAtomTerm: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
+        onIncompleteAtom: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
     },
     fn onUnknownToken(self: ErrorHandler, an: Annotation) void {
         self.vtable.onUnknownToken(self.ptr, an);
     }
     fn onMalformedString(self: ErrorHandler, an: Annotation) void {
         self.vtable.onMalformedString(self.ptr, an);
+    }
+    fn onExpectedTerm(self: ErrorHandler, an: TokenAnnotation) void {
+        self.vtable.onExpectedTerm(self.ptr, an);
+    }
+    fn onExpectedPredicate(self: ErrorHandler, an: TokenAnnotation) void {
+        self.vtable.onExpectedPredicate(self.ptr, an);
+    }
+    fn onExpectedRuleClause(self: ErrorHandler, an: TokenAnnotation) void {
+        self.vtable.onExpectedRuleClause(self.ptr, an);
+    }
+    fn onExpectedRuleDef(self: ErrorHandler, an: TokenAnnotation) void {
+        self.vtable.onExpectedRuleDef(self.ptr, an);
+    }
+    fn onExpectedAtomTerm(self: ErrorHandler, an: TokenAnnotation) void {
+        self.vtable.onExpectedAtomTerm(self.ptr, an);
+    }
+    fn onIncompleteAtom(self: ErrorHandler, an: TokenAnnotation) void {
+        self.vtable.onIncompleteAtom(self.ptr, an);
     }
 };
 
@@ -98,18 +123,6 @@ pub const ast = struct {
         source: Source,
         tokens: []const Token,
         statements: []const Rule,
-        pub fn annotateRule(self: *const File, rule: *const Rule) Annotation {
-            const token = &self.tokens[rule.token];
-            const start = @intFromPtr(self.source.code.ptr);
-            const end = @intFromPtr(token.slice.ptr);
-            return Annotation.annotate(self.source, end - start);
-        }
-        pub fn annotateAtom(self: *const File, atom: *const Atom) Annotation {
-            const token = &self.tokens[atom.token];
-            const start = @intFromPtr(self.source.code.ptr);
-            const end = @intFromPtr(token.slice.ptr);
-            return Annotation.annotate(self.source, end - start);
-        }
     };
 
     /// Extract an abstract syntax tree from file buffer contents named `name`.
@@ -134,16 +147,28 @@ pub const ast = struct {
             if (error_state) return error.ParseError;
             break :tokens try ts.toOwnedSlice(allocator);
         };
-        var statements: ArrayListUnmanaged(Rule) = .empty;
-        var parser = Parser{ .stream = tokens };
-        while (!parser.eof()) {
-            const rule, parser = try parser.rule(allocator);
-            try statements.append(allocator, rule);
-        }
+        const statements = statements: {
+            var error_state: bool = false;
+            var rules: ArrayListUnmanaged(Rule) = .empty;
+            var parser = Parser{ .source = source, .stream = tokens };
+            while (!parser.eof()) {
+                const rule, parser = parser.rule(allocator, handler) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ParseError => {
+                        error_state = true;
+                        parser = parser.recover();
+                        continue;
+                    },
+                };
+                if (!error_state) try rules.append(allocator, rule);
+            }
+            if (error_state) return error.ParseError;
+            break :statements try rules.toOwnedSlice(allocator);
+        };
         return File{
             .source = source,
             .tokens = tokens,
-            .statements = try statements.toOwnedSlice(allocator),
+            .statements = statements,
         };
     }
 };
@@ -158,9 +183,15 @@ const Parser = struct {
     /// Current position of the parser in token's stream slice.
     cursor: u32 = 0,
     stream: []const Token,
+    source: Source,
 
     inline fn eof(self: Parser) bool {
         return self.stream.len <= self.cursor;
+    }
+    fn annotation(self: Parser) TokenAnnotation {
+        assert(!self.eof());
+        const token = self.stream[self.cursor];
+        return token.annotate(self.source);
     }
 
     /// Pop token from the stream and bump cursor if stream has more tokens.
@@ -169,6 +200,7 @@ const Parser = struct {
         return .{
             self.stream[self.cursor],
             .{
+                .source = self.source,
                 .stream = self.stream,
                 .cursor = self.cursor + 1,
             },
@@ -185,8 +217,21 @@ const Parser = struct {
         return null;
     }
 
+    fn recover(self: Parser) Parser {
+        var parser = self;
+        while (true) {
+            if (parser.advance()) |next| {
+                const token, parser = next;
+                if (token.t == .dot) return parser;
+            } else {
+                return parser;
+            }
+        }
+    }
+
     /// An identifier literal, a string literal, a variable or wildcard.
-    fn term(self: Parser) !Result(ast.Term) {
+    fn term(self: Parser, handler: ErrorHandler) !Result(ast.Term) {
+        assert(!self.eof());
         var parser = self;
         if (self.lookup(.identifier)) |result| {
             const token, parser = result;
@@ -205,25 +250,38 @@ const Parser = struct {
                 parser,
             };
         }
+        handler.onExpectedTerm(self.annotation());
         return error.ParseError;
     }
 
     /// Predicate symbol.
-    fn predicate(self: Parser) !Result([]const u8) {
+    fn predicate(self: Parser, handler: ErrorHandler) !Result([]const u8) {
+        assert(!self.eof());
         var parser = self;
         if (parser.lookup(.identifier)) |result| {
             const token, parser = result;
-            if (std.ascii.isUpper(token.slice[0])) return error.ParseError;
-            if (std.mem.eql(u8, token.slice, "_")) return error.ParseError;
+            if (std.ascii.isUpper(token.slice[0])) {
+                handler.onExpectedPredicate(self.annotation());
+                return error.ParseError;
+            }
+            if (std.mem.eql(u8, token.slice, "_")) {
+                handler.onExpectedPredicate(self.annotation());
+                return error.ParseError;
+            }
             return .{ token.slice, parser };
         }
+        handler.onExpectedPredicate(self.annotation());
         return error.ParseError;
     }
 
     /// Atom consists of a predicate symbol and a list of terms in parenthesis.
-    fn atom(self: Parser, allocator: Allocator) !Result(ast.Atom) {
+    fn atom(
+        self: Parser,
+        allocator: Allocator,
+        handler: ErrorHandler,
+    ) !Result(ast.Atom) {
         var parser = self;
-        const pred, parser = try parser.predicate();
+        const pred, parser = try parser.predicate(handler);
         if (parser.lookup(.parenthesis_left)) |parenthesis_left| {
             _, parser = parenthesis_left;
             if (parser.lookup(.parenthesis_right)) |parenthesis_right| {
@@ -233,10 +291,11 @@ const Parser = struct {
             var terms: ArrayListUnmanaged(ast.Term) = .empty;
             errdefer terms.deinit(allocator);
             {
-                const t, parser = try parser.term();
+                const t, parser = try parser.term(handler);
                 try terms.append(allocator, t);
             }
             while (parser.advance()) |result| {
+                const prior = parser;
                 const token, parser = result;
                 switch (token.t) {
                     .parenthesis_right => {
@@ -250,12 +309,16 @@ const Parser = struct {
                         };
                     },
                     .comma => {
-                        const t, parser = try parser.term();
+                        const t, parser = try parser.term(handler);
                         try terms.append(allocator, t);
                     },
-                    else => return error.ParseError,
+                    else => {
+                        handler.onExpectedAtomTerm(prior.annotation());
+                        return error.ParseError;
+                    },
                 }
             }
+            handler.onIncompleteAtom(parser.annotation());
             return error.ParseError;
         } else {
             return .{ ast.Atom{ .token = self.cursor, .predicate = pred }, parser };
@@ -263,9 +326,13 @@ const Parser = struct {
     }
 
     /// Datalog rule.
-    fn rule(self: Parser, allocator: Allocator) !Result(ast.Rule) {
+    fn rule(
+        self: Parser,
+        allocator: Allocator,
+        handler: ErrorHandler,
+    ) !Result(ast.Rule) {
         var parser = self;
-        const head, parser = try parser.atom(allocator);
+        const head, parser = try parser.atom(allocator, handler);
         if (parser.lookup(.dot)) |result| {
             _, parser = result;
             return .{ ast.Rule{
@@ -278,7 +345,7 @@ const Parser = struct {
             var atoms: ArrayListUnmanaged(ast.Atom) = .empty;
             errdefer atoms.deinit(allocator);
             while (true) {
-                const at, parser = try parser.atom(allocator);
+                const at, parser = try parser.atom(allocator, handler);
                 try atoms.append(allocator, at);
                 if (parser.lookup(.dot)) |dot| {
                     _, parser = dot;
@@ -295,17 +362,19 @@ const Parser = struct {
                     _, parser = comma;
                     continue;
                 }
+                handler.onExpectedRuleClause(parser.annotation());
                 return error.ParseError;
             }
         }
+        handler.onExpectedRuleDef(parser.annotation());
         return error.ParseError;
     }
 };
 
-const Token = struct {
+pub const Token = struct {
     t: Type,
     slice: []const u8,
-    const Type = enum {
+    pub const Type = enum {
         identifier, // Alphabetic identifier, a constant or a variable including wildcards.
         string, // String constant enclosed in apostophes symbol, can't span mutiple lines.
         implication, // Punctuation to separate rule's head from it's body.
@@ -314,6 +383,11 @@ const Token = struct {
         comma,
         dot,
     };
+    fn annotate(self: Token, source: Source) TokenAnnotation {
+        const start = @intFromPtr(source.code.ptr);
+        const end = @intFromPtr(self.slice.ptr);
+        return .{ self, Annotation.annotate(source, end - start) };
+    }
 };
 
 const TokenStream = struct {

@@ -136,33 +136,101 @@ const ErrorReport = union(enum) {
 
 const ReportingHandler = struct {
     dest: File,
+    fn genericTokenizerError(
+        self: *const ReportingHandler,
+        an: lang.Annotation,
+        comptime message: []const u8,
+        args: anytype,
+    ) void {
+        errdefer unreachable;
+        var report = ErrorReport.init(self.dest);
+        try report.header(
+            "{s}:{}:{} tokenizer error:",
+            .{ an.source.name, an.line, an.column },
+        );
+        try report.message(message, args);
+        try report.code(an.view());
+        try report.pointAt(an.column, "", .{});
+        try report.footer();
+    }
+    fn genericParserError(
+        self: *const ReportingHandler,
+        an: lang.Annotation,
+        comptime message: []const u8,
+        args: anytype,
+    ) void {
+        errdefer unreachable;
+        var r = ErrorReport.init(self.dest);
+        try r.header(
+            "{s}:{}:{} parser error:",
+            .{ an.source.name, an.line, an.column },
+        );
+        try r.message(message, args);
+        try r.code(an.view());
+        try r.pointAt(an.column, "", .{});
+        try r.footer();
+    }
     fn handler(self: *ReportingHandler) lang.ErrorHandler {
         const interface = struct {
             fn onUnknownToken(ctx: *anyopaque, an: lang.Annotation) void {
-                errdefer unreachable;
                 const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
-                var r = ErrorReport.init(this.dest);
-                try r.header(
-                    "{s}:{}:{} tokenizer error:",
-                    .{ an.source.name, an.line, an.column },
-                );
-                try r.message("Unknown token", .{});
-                try r.code(an.view());
-                try r.pointAt(an.column, "here", .{});
-                try r.footer();
+                this.genericTokenizerError(an, "Unknown token", .{});
             }
             fn onMalformedString(ctx: *anyopaque, an: lang.Annotation) void {
+                const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
+                this.genericTokenizerError(an, "Malformed string", .{});
+            }
+            fn onExpectedTerm(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
+                const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
+                const token, const an = ta;
+                this.genericParserError(
+                    an,
+                    "Expected atom's term, found: {s}",
+                    .{@tagName(token.t)},
+                );
+            }
+            fn onExpectedPredicate(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
+                const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
+                const token, const an = ta;
+                this.genericParserError(
+                    an,
+                    "Expected a predicate, found: {s}",
+                    .{@tagName(token.t)},
+                );
+            }
+            fn onExpectedRuleClause(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
+                const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
+                const token, const an = ta;
+                this.genericParserError(
+                    an,
+                    "Expected a rule clause definition, found: {s}",
+                    .{@tagName(token.t)},
+                );
+            }
+            fn onExpectedRuleDef(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
+                const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
+                const token, const an = ta;
+                this.genericParserError(
+                    an,
+                    "Expected a valid rule definition, found: {s}",
+                    .{@tagName(token.t)},
+                );
+            }
+            fn onExpectedAtomTerm(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
+                const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
+                const token, const an = ta;
+                this.genericParserError(
+                    an,
+                    "Expected an atom's term, found: {s}",
+                    .{@tagName(token.t)},
+                );
+            }
+            fn onIncompleteAtom(ctx: *anyopaque, an: lang.TokenAnnotation) void {
                 errdefer unreachable;
                 const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
-                var r = ErrorReport.init(this.dest);
-                try r.header(
-                    "{s}:{}:{} tokenizer error:",
-                    .{ an.source.name, an.line, an.column },
-                );
-                try r.message("Malformed string", .{});
-                try r.code(an.view());
-                try r.pointAt(an.column, "here", .{});
-                try r.footer();
+                std.debug.print("onIncompleteAtom", .{});
+                _ = this;
+                _ = an;
             }
         };
         return lang.ErrorHandler{
@@ -170,6 +238,12 @@ const ReportingHandler = struct {
             .vtable = .{
                 .onUnknownToken = interface.onUnknownToken,
                 .onMalformedString = interface.onMalformedString,
+                .onExpectedTerm = interface.onExpectedTerm,
+                .onExpectedPredicate = interface.onExpectedPredicate,
+                .onExpectedRuleClause = interface.onExpectedRuleClause,
+                .onExpectedRuleDef = interface.onExpectedRuleDef,
+                .onExpectedAtomTerm = interface.onExpectedAtomTerm,
+                .onIncompleteAtom = interface.onIncompleteAtom,
             },
         };
     }

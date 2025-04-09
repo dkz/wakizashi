@@ -150,13 +150,17 @@ pub const ast = struct {
         const statements = statements: {
             var error_state: bool = false;
             var rules: ArrayListUnmanaged(Rule) = .empty;
-            var parser = Parser{ .source = source, .stream = tokens };
-            while (!parser.eof()) {
-                const rule, parser = parser.rule(allocator, handler) catch |e| switch (e) {
+            var parser: ?Parser =
+                if (tokens.len == 0) null else Parser{
+                    .source = source,
+                    .stream = tokens,
+                };
+            while (parser) |p| {
+                const rule, parser = p.rule(allocator, handler) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.ParseError => {
                         error_state = true;
-                        parser = parser.recover();
+                        parser = p.recover();
                         continue;
                     },
                 };
@@ -177,64 +181,55 @@ pub const ast = struct {
 /// Parsers are call-by-value, so fallback parser always stays up on stack for robust error reporting.
 const Parser = struct {
     /// Combines typed parsing result with an immutable continuation of the parser.
+    /// Returns null when token stream is exhausted.
     fn Result(comptime T: type) type {
-        return struct { T, Parser };
+        return struct { T, ?Parser };
     }
-    /// Current position of the parser in token's stream slice.
+
     cursor: u32 = 0,
     stream: []const Token,
     source: Source,
 
-    inline fn eof(self: Parser) bool {
-        return self.stream.len <= self.cursor;
-    }
+    /// Returns token annotation at position of the parser.
     fn annotation(self: Parser) TokenAnnotation {
-        assert(!self.eof());
         const token = self.stream[self.cursor];
         return token.annotate(self.source);
     }
 
     /// Pop token from the stream and bump cursor if stream has more tokens.
-    fn advance(self: Parser) ?Result(Token) {
-        if (self.eof()) return null;
-        return .{
-            self.stream[self.cursor],
-            .{
-                .source = self.source,
+    fn advance(self: Parser) Result(Token) {
+        const token = self.stream[self.cursor];
+        const increment = self.cursor + 1;
+        return if (self.stream.len <= increment) .{ token, null } else .{
+            token,
+            Parser{
+                .cursor = increment,
                 .stream = self.stream,
-                .cursor = self.cursor + 1,
+                .source = self.source,
             },
         };
     }
 
     /// Pop token from the stream but only if it matches the token type.
     fn lookup(self: Parser, t: Token.Type) ?Result(Token) {
-        var parser = self;
-        if (parser.advance()) |result| {
-            const token, parser = result;
-            return if (token.t == t) .{ token, parser } else null;
+        const token, const parser = self.advance();
+        return if (token.t == t) .{ token, parser } else null;
+    }
+
+    fn recover(self: Parser) ?Parser {
+        var parser: ?Parser = self;
+        while (parser) |p| {
+            const token, parser = p.advance();
+            if (token.t == .dot) return parser;
         }
         return null;
     }
 
-    fn recover(self: Parser) Parser {
-        var parser = self;
-        while (true) {
-            if (parser.advance()) |next| {
-                const token, parser = next;
-                if (token.t == .dot) return parser;
-            } else {
-                return parser;
-            }
-        }
-    }
-
     /// An identifier literal, a string literal, a variable or wildcard.
     fn term(self: Parser, handler: ErrorHandler) !Result(ast.Term) {
-        assert(!self.eof());
-        var parser = self;
-        if (self.lookup(.identifier)) |result| {
-            const token, parser = result;
+        var parser: ?Parser = self;
+        if (self.lookup(.identifier)) |identifier| {
+            const token, parser = identifier;
             if (std.mem.eql(u8, token.slice, "_")) {
                 return .{ ast.Term.wildcard, parser };
             }
@@ -243,8 +238,8 @@ const Parser = struct {
             }
             return .{ ast.Term{ .literal = token.slice }, parser };
         }
-        if (self.lookup(.string)) |result| {
-            const token, parser = result;
+        if (self.lookup(.string)) |string| {
+            const token, parser = string;
             return .{
                 ast.Term{ .literal = token.slice },
                 parser,
@@ -256,10 +251,8 @@ const Parser = struct {
 
     /// Predicate symbol.
     fn predicate(self: Parser, handler: ErrorHandler) !Result([]const u8) {
-        assert(!self.eof());
-        var parser = self;
-        if (parser.lookup(.identifier)) |result| {
-            const token, parser = result;
+        if (self.lookup(.identifier)) |identifier| {
+            const token, const parser = identifier;
             if (std.ascii.isUpper(token.slice[0])) {
                 handler.onExpectedPredicate(self.annotation());
                 return error.ParseError;
@@ -280,48 +273,64 @@ const Parser = struct {
         allocator: Allocator,
         handler: ErrorHandler,
     ) !Result(ast.Atom) {
-        var parser = self;
-        const pred, parser = try parser.predicate(handler);
-        if (parser.lookup(.parenthesis_left)) |parenthesis_left| {
-            _, parser = parenthesis_left;
-            if (parser.lookup(.parenthesis_right)) |parenthesis_right| {
-                _, parser = parenthesis_right;
-                return .{ ast.Atom{ .token = self.cursor, .predicate = pred }, parser };
-            }
-            var terms: ArrayListUnmanaged(ast.Term) = .empty;
-            errdefer terms.deinit(allocator);
-            {
-                const t, parser = try parser.term(handler);
-                try terms.append(allocator, t);
-            }
-            while (parser.advance()) |result| {
-                const prior = parser;
-                const token, parser = result;
-                switch (token.t) {
-                    .parenthesis_right => {
+        const pred, var parser: ?Parser = try self.predicate(handler);
+        if (parser) |p1| {
+            if (p1.lookup(.parenthesis_left)) |parenthesis_left| {
+                _, parser = parenthesis_left;
+                if (parser) |p2| {
+                    if (p2.lookup(.parenthesis_right)) |parenthesis_right| {
+                        _, parser = parenthesis_right;
                         return .{
-                            ast.Atom{
-                                .token = self.cursor,
-                                .predicate = pred,
-                                .terms = try terms.toOwnedSlice(allocator),
-                            },
+                            ast.Atom{ .token = self.cursor, .predicate = pred },
                             parser,
                         };
-                    },
-                    .comma => {
-                        const t, parser = try parser.term(handler);
+                    }
+                    var terms: ArrayListUnmanaged(ast.Term) = .empty;
+                    errdefer terms.deinit(allocator);
+                    {
+                        const t, parser = try p2.term(handler);
                         try terms.append(allocator, t);
-                    },
-                    else => {
-                        handler.onExpectedAtomTerm(prior.annotation());
-                        return error.ParseError;
-                    },
+                    }
+                    while (parser) |p| {
+                        const token, parser = p.advance();
+                        switch (token.t) {
+                            .parenthesis_right => {
+                                return .{
+                                    ast.Atom{
+                                        .token = self.cursor,
+                                        .predicate = pred,
+                                        .terms = try terms.toOwnedSlice(allocator),
+                                    },
+                                    parser,
+                                };
+                            },
+                            .comma => {
+                                if (parser) |p3| {
+                                    const t, parser = try p3.term(handler);
+                                    try terms.append(allocator, t);
+                                } else {
+                                    handler.onExpectedAtomTerm(p.annotation());
+                                    return error.ParseError;
+                                }
+                            },
+                            else => {
+                                handler.onExpectedAtomTerm(p.annotation());
+                                return error.ParseError;
+                            },
+                        }
+                    }
+                    handler.onIncompleteAtom(self.annotation());
+                    return error.ParseError;
+                } else {
+                    handler.onIncompleteAtom(self.annotation());
+                    return error.ParseError;
                 }
+            } else {
+                return .{ ast.Atom{ .token = self.cursor, .predicate = pred }, parser };
             }
-            handler.onIncompleteAtom(parser.annotation());
-            return error.ParseError;
         } else {
-            return .{ ast.Atom{ .token = self.cursor, .predicate = pred }, parser };
+            handler.onIncompleteAtom(self.annotation());
+            return error.ParseError;
         }
     }
 
@@ -331,43 +340,64 @@ const Parser = struct {
         allocator: Allocator,
         handler: ErrorHandler,
     ) !Result(ast.Rule) {
-        var parser = self;
-        const head, parser = try parser.atom(allocator, handler);
-        if (parser.lookup(.dot)) |result| {
-            _, parser = result;
-            return .{ ast.Rule{
-                .token = self.cursor,
-                .head = head,
-            }, parser };
-        }
-        if (parser.lookup(.implication)) |implication| {
-            _, parser = implication;
-            var atoms: ArrayListUnmanaged(ast.Atom) = .empty;
-            errdefer atoms.deinit(allocator);
-            while (true) {
-                const at, parser = try parser.atom(allocator, handler);
-                try atoms.append(allocator, at);
-                if (parser.lookup(.dot)) |dot| {
-                    _, parser = dot;
-                    return .{
-                        ast.Rule{
-                            .token = self.cursor,
-                            .head = head,
-                            .body = try atoms.toOwnedSlice(allocator),
-                        },
-                        parser,
-                    };
-                }
-                if (parser.lookup(.comma)) |comma| {
-                    _, parser = comma;
-                    continue;
-                }
-                handler.onExpectedRuleClause(parser.annotation());
+        var parser: ?Parser = self;
+        const head = head: {
+            if (parser) |p| {
+                const h, parser = try p.atom(allocator, handler);
+                break :head h;
+            } else {
+                handler.onExpectedRuleDef(self.annotation());
                 return error.ParseError;
             }
+        };
+        if (parser) |p| {
+            if (p.lookup(.dot)) |dot| {
+                _, parser = dot;
+                return .{
+                    ast.Rule{
+                        .token = self.cursor,
+                        .head = head,
+                    },
+                    parser,
+                };
+            }
+            if (p.lookup(.implication)) |implication| {
+                _, parser = implication;
+                var atoms: ArrayListUnmanaged(ast.Atom) = .empty;
+                errdefer atoms.deinit(allocator);
+                while (parser) |p1| {
+                    const at, parser = try p1.atom(allocator, handler);
+                    try atoms.append(allocator, at);
+                    if (parser) |p2| {
+                        if (p2.lookup(.dot)) |dot| {
+                            _, parser = dot;
+                            return .{
+                                ast.Rule{
+                                    .token = self.cursor,
+                                    .head = head,
+                                    .body = try atoms.toOwnedSlice(allocator),
+                                },
+                                parser,
+                            };
+                        }
+                        if (p2.lookup(.comma)) |comma| {
+                            _, parser = comma;
+                            continue;
+                        }
+                        handler.onExpectedRuleClause(p2.annotation());
+                        return error.ParseError;
+                    } else {
+                        handler.onExpectedRuleClause(p1.annotation());
+                        return error.ParseError;
+                    }
+                }
+            }
+            handler.onExpectedRuleDef(self.annotation());
+            return error.ParseError;
+        } else {
+            handler.onExpectedRuleDef(self.annotation());
+            return error.ParseError;
         }
-        handler.onExpectedRuleDef(parser.annotation());
-        return error.ParseError;
     }
 };
 

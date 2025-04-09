@@ -209,11 +209,11 @@ const ReportingHandler = struct {
             }
             fn onExpectedRuleDef(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
                 const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
-                const token, const an = ta;
+                _, const an = ta;
                 this.genericParserError(
                     an,
-                    "Expected a valid rule definition, found: {s}",
-                    .{@tagName(token.t)},
+                    "Expected a valid rule definition",
+                    .{},
                 );
             }
             fn onExpectedAtomTerm(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
@@ -225,12 +225,11 @@ const ReportingHandler = struct {
                     .{@tagName(token.t)},
                 );
             }
-            fn onIncompleteAtom(ctx: *anyopaque, an: lang.TokenAnnotation) void {
+            fn onIncompleteAtom(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
                 errdefer unreachable;
                 const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
-                std.debug.print("onIncompleteAtom", .{});
-                _ = this;
-                _ = an;
+                _, const an = ta;
+                this.genericParserError(an, "Incomplete atom", .{});
             }
         };
         return lang.ErrorHandler{

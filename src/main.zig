@@ -198,38 +198,36 @@ const ReportingHandler = struct {
                     .{@tagName(token.t)},
                 );
             }
-            fn onExpectedRuleClause(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
-                const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
-                const token, const an = ta;
-                this.genericParserError(
-                    an,
-                    "Expected a rule clause definition, found: {s}",
-                    .{@tagName(token.t)},
-                );
-            }
-            fn onExpectedRuleDef(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
+            fn onExpectedAtomTermAfter(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
                 const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
                 _, const an = ta;
-                this.genericParserError(
-                    an,
-                    "Expected a valid rule definition",
-                    .{},
-                );
+                this.genericParserError(an, "Expected a valid atom's term", .{});
             }
-            fn onExpectedAtomTerm(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
+            fn onExpectedRuleAtomAfter(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
                 const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
-                const token, const an = ta;
-                this.genericParserError(
-                    an,
-                    "Expected an atom's term, found: {s}",
-                    .{@tagName(token.t)},
-                );
+                _, const an = ta;
+                this.genericParserError(an, "Expected a valid rule's atom", .{});
             }
-            fn onIncompleteAtom(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
+            fn onMalformedRule(ctx: *anyopaque, ta: lang.TokenAnnotation) void {
                 errdefer unreachable;
                 const this: *ReportingHandler = @ptrCast(@alignCast(ctx));
                 _, const an = ta;
-                this.genericParserError(an, "Incomplete atom", .{});
+                var r = ErrorReport.init(this.dest);
+                try r.header(
+                    "{s}:{}:{} parser error:",
+                    .{ an.source.name, an.line, an.column },
+                );
+                try r.message("Malformed rule definition:", .{});
+                try r.code(an.view());
+                try r.message(
+                    "Rule must consist of a head atom, an implication operator,",
+                    .{},
+                );
+                try r.message(
+                    "and a list of body atoms. Definition ends with a dot.",
+                    .{},
+                );
+                try r.footer();
             }
         };
         return lang.ErrorHandler{
@@ -239,10 +237,9 @@ const ReportingHandler = struct {
                 .onMalformedString = interface.onMalformedString,
                 .onExpectedTerm = interface.onExpectedTerm,
                 .onExpectedPredicate = interface.onExpectedPredicate,
-                .onExpectedRuleClause = interface.onExpectedRuleClause,
-                .onExpectedRuleDef = interface.onExpectedRuleDef,
-                .onExpectedAtomTerm = interface.onExpectedAtomTerm,
-                .onIncompleteAtom = interface.onIncompleteAtom,
+                .onExpectedAtomTermAfter = interface.onExpectedAtomTermAfter,
+                .onExpectedRuleAtomAfter = interface.onExpectedRuleAtomAfter,
+                .onMalformedRule = interface.onMalformedRule,
             },
         };
     }

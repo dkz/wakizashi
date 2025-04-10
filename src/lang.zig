@@ -67,10 +67,9 @@ pub const ErrorHandler = struct {
         onMalformedString: *const fn (ptr: *anyopaque, an: Annotation) void,
         onExpectedTerm: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
         onExpectedPredicate: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
-        onExpectedRuleClause: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
-        onExpectedRuleDef: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
-        onExpectedAtomTerm: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
-        onIncompleteAtom: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
+        onExpectedAtomTermAfter: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
+        onExpectedRuleAtomAfter: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
+        onMalformedRule: *const fn (ptr: *anyopaque, an: TokenAnnotation) void,
     },
     fn onUnknownToken(self: ErrorHandler, an: Annotation) void {
         self.vtable.onUnknownToken(self.ptr, an);
@@ -84,17 +83,14 @@ pub const ErrorHandler = struct {
     fn onExpectedPredicate(self: ErrorHandler, an: TokenAnnotation) void {
         self.vtable.onExpectedPredicate(self.ptr, an);
     }
-    fn onExpectedRuleClause(self: ErrorHandler, an: TokenAnnotation) void {
-        self.vtable.onExpectedRuleClause(self.ptr, an);
+    fn onExpectedAtomTermAfter(self: ErrorHandler, an: TokenAnnotation) void {
+        self.vtable.onExpectedAtomTermAfter(self.ptr, an);
     }
-    fn onExpectedRuleDef(self: ErrorHandler, an: TokenAnnotation) void {
-        self.vtable.onExpectedRuleDef(self.ptr, an);
+    fn onExpectedRuleAtomAfter(self: ErrorHandler, an: TokenAnnotation) void {
+        self.vtable.onExpectedRuleAtomAfter(self.ptr, an);
     }
-    fn onExpectedAtomTerm(self: ErrorHandler, an: TokenAnnotation) void {
-        self.vtable.onExpectedAtomTerm(self.ptr, an);
-    }
-    fn onIncompleteAtom(self: ErrorHandler, an: TokenAnnotation) void {
-        self.vtable.onIncompleteAtom(self.ptr, an);
+    fn onMalformedRule(self: ErrorHandler, an: TokenAnnotation) void {
+        self.vtable.onMalformedRule(self.ptr, an);
     }
 };
 
@@ -216,6 +212,10 @@ const Parser = struct {
         return if (token.t == t) .{ token, parser } else null;
     }
 
+    inline fn maybeLookup(parser: ?Parser, t: Token.Type) ?Result(Token) {
+        return if (parser) |p| p.lookup(t) else null;
+    }
+
     fn recover(self: Parser) ?Parser {
         var parser: ?Parser = self;
         while (parser) |p| {
@@ -274,63 +274,67 @@ const Parser = struct {
         handler: ErrorHandler,
     ) !Result(ast.Atom) {
         const pred, var parser: ?Parser = try self.predicate(handler);
-        if (parser) |p1| {
-            if (p1.lookup(.parenthesis_left)) |parenthesis_left| {
-                _, parser = parenthesis_left;
-                if (parser) |p2| {
-                    if (p2.lookup(.parenthesis_right)) |parenthesis_right| {
-                        _, parser = parenthesis_right;
-                        return .{
-                            ast.Atom{ .token = self.cursor, .predicate = pred },
-                            parser,
-                        };
-                    }
-                    var terms: ArrayListUnmanaged(ast.Term) = .empty;
-                    errdefer terms.deinit(allocator);
-                    {
-                        const t, parser = try p2.term(handler);
-                        try terms.append(allocator, t);
-                    }
-                    while (parser) |p| {
-                        const token, parser = p.advance();
-                        switch (token.t) {
-                            .parenthesis_right => {
-                                return .{
-                                    ast.Atom{
-                                        .token = self.cursor,
-                                        .predicate = pred,
-                                        .terms = try terms.toOwnedSlice(allocator),
-                                    },
-                                    parser,
-                                };
-                            },
-                            .comma => {
-                                if (parser) |p3| {
-                                    const t, parser = try p3.term(handler);
-                                    try terms.append(allocator, t);
-                                } else {
-                                    handler.onExpectedAtomTerm(p.annotation());
-                                    return error.ParseError;
-                                }
-                            },
-                            else => {
-                                handler.onExpectedAtomTerm(p.annotation());
-                                return error.ParseError;
-                            },
-                        }
-                    }
-                    handler.onIncompleteAtom(self.annotation());
-                    return error.ParseError;
-                } else {
-                    handler.onIncompleteAtom(self.annotation());
-                    return error.ParseError;
-                }
-            } else {
-                return .{ ast.Atom{ .token = self.cursor, .predicate = pred }, parser };
+        if (Parser.maybeLookup(parser, .parenthesis_left)) |open| {
+            var last = parser.?; // Keeps position of the last successful parse.
+            _, parser = open;
+            if (Parser.maybeLookup(parser, .parenthesis_right)) |close| {
+                _, parser = close;
+                return .{
+                    ast.Atom{
+                        .token = self.cursor,
+                        .predicate = pred,
+                    },
+                    parser,
+                };
             }
-        } else {
-            handler.onIncompleteAtom(self.annotation());
+            var terms: ArrayListUnmanaged(ast.Term) = .empty;
+            errdefer terms.deinit(allocator);
+            if (parser) |p| {
+                last = p;
+                const t, parser = try p.term(handler);
+                try terms.append(allocator, t);
+            } else {
+                handler.onExpectedAtomTermAfter(last.annotation());
+                return error.ParseError;
+            }
+            while (parser) |p| {
+                last = p;
+                const token, parser = p.advance();
+                switch (token.t) {
+                    .parenthesis_right => return .{
+                        ast.Atom{
+                            .token = self.cursor,
+                            .predicate = pred,
+                            .terms = try terms.toOwnedSlice(allocator),
+                        },
+                        parser,
+                    },
+                    .comma => {
+                        if (parser) |next| {
+                            last = next;
+                            const t, parser = try next.term(handler);
+                            try terms.append(allocator, t);
+                        } else {
+                            handler.onExpectedAtomTermAfter(last.annotation());
+                            return error.ParseError;
+                        }
+                    },
+                    else => {
+                        handler.onExpectedAtomTermAfter(last.annotation());
+                        return error.ParseError;
+                    },
+                }
+            }
+            handler.onExpectedAtomTermAfter(last.annotation());
             return error.ParseError;
+        } else {
+            return .{
+                ast.Atom{
+                    .token = self.cursor,
+                    .predicate = pred,
+                },
+                parser,
+            };
         }
     }
 
@@ -340,64 +344,63 @@ const Parser = struct {
         allocator: Allocator,
         handler: ErrorHandler,
     ) !Result(ast.Rule) {
-        var parser: ?Parser = self;
-        const head = head: {
+        const head, var parser: ?Parser = try self.atom(allocator, handler);
+        if (Parser.maybeLookup(parser, .dot)) |p| {
+            _, parser = p;
+            return .{
+                ast.Rule{
+                    .token = self.cursor,
+                    .head = head,
+                },
+                parser,
+            };
+        }
+        if (Parser.maybeLookup(parser, .implication)) |implication| {
+            var last = parser.?; // Keeps position of the last successful parse.
+            _, parser = implication;
+            var atoms: ArrayListUnmanaged(ast.Atom) = .empty;
+            errdefer atoms.deinit(allocator);
             if (parser) |p| {
-                const h, parser = try p.atom(allocator, handler);
-                break :head h;
+                last = p;
+                const a, parser = try p.atom(allocator, handler);
+                try atoms.append(allocator, a);
             } else {
-                handler.onExpectedRuleDef(self.annotation());
+                handler.onExpectedRuleAtomAfter(last.annotation());
                 return error.ParseError;
             }
-        };
-        if (parser) |p| {
-            if (p.lookup(.dot)) |dot| {
-                _, parser = dot;
-                return .{
-                    ast.Rule{
-                        .token = self.cursor,
-                        .head = head,
+            while (parser) |p| {
+                last = p;
+                const token, parser = p.advance();
+                switch (token.t) {
+                    .dot => return .{
+                        ast.Rule{
+                            .token = self.cursor,
+                            .head = head,
+                            .body = try atoms.toOwnedSlice(allocator),
+                        },
+                        parser,
                     },
-                    parser,
-                };
-            }
-            if (p.lookup(.implication)) |implication| {
-                _, parser = implication;
-                var atoms: ArrayListUnmanaged(ast.Atom) = .empty;
-                errdefer atoms.deinit(allocator);
-                while (parser) |p1| {
-                    const at, parser = try p1.atom(allocator, handler);
-                    try atoms.append(allocator, at);
-                    if (parser) |p2| {
-                        if (p2.lookup(.dot)) |dot| {
-                            _, parser = dot;
-                            return .{
-                                ast.Rule{
-                                    .token = self.cursor,
-                                    .head = head,
-                                    .body = try atoms.toOwnedSlice(allocator),
-                                },
-                                parser,
-                            };
+                    .comma => {
+                        if (parser) |next| {
+                            last = next;
+                            const a, parser = try next.atom(allocator, handler);
+                            try atoms.append(allocator, a);
+                        } else {
+                            handler.onExpectedRuleAtomAfter(last.annotation());
+                            return error.ParseError;
                         }
-                        if (p2.lookup(.comma)) |comma| {
-                            _, parser = comma;
-                            continue;
-                        }
-                        handler.onExpectedRuleClause(p2.annotation());
+                    },
+                    else => {
+                        handler.onMalformedRule(self.annotation());
                         return error.ParseError;
-                    } else {
-                        handler.onExpectedRuleClause(p1.annotation());
-                        return error.ParseError;
-                    }
+                    },
                 }
             }
-            handler.onExpectedRuleDef(self.annotation());
-            return error.ParseError;
-        } else {
-            handler.onExpectedRuleDef(self.annotation());
+            handler.onMalformedRule(last.annotation());
             return error.ParseError;
         }
+        handler.onMalformedRule(self.annotation());
+        return error.ParseError;
     }
 };
 
